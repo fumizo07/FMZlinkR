@@ -15,6 +15,7 @@ interface IShellService {
     void stopVoipRecording() = 10;
     boolean voipFarPartyHeard() = 11;
     int voipCallAppUid() = 12;
+    boolean voipNearPartyHeard() = 13;
 
     /** Shizuku special destroy transaction. Terminates only FMZlinkR's UserService process. */
     void destroy() = 16777114;
