@@ -91,8 +91,14 @@ class ShizukuConnectionManager(
             return@suspendCancellableCoroutine
         }
 
-        val connection = object : ServiceConnection {
+        lateinit var connection: ServiceConnection
+        connection = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+                // A cancelled/old bind may still receive a late callback. Never let it replace a newer bind.
+                if (serviceConnection !== connection) {
+                    AppLogger.d("Ignoring stale FMZlinkR UserService connected callback")
+                    return
+                }
                 if (binder == null) {
                     serviceConnection = null
                     if (continuation.isActive) {
@@ -108,6 +114,8 @@ class ShizukuConnectionManager(
             }
 
             override fun onServiceDisconnected(name: ComponentName?) {
+                // Intentional unbind/remove clears serviceConnection first, so its callback is ignored here.
+                if (serviceConnection !== connection) return
                 serviceConnection = null
                 AppLogger.w("FMZlinkR Shizuku UserService disconnected")
                 if (continuation.isActive) {
@@ -122,32 +130,39 @@ class ShizukuConnectionManager(
         try {
             Shizuku.bindUserService(userServiceArgs, connection)
         } catch (e: Exception) {
-            serviceConnection = null
+            if (serviceConnection === connection) serviceConnection = null
             continuation.resumeWithException(e)
             return@suspendCancellableCoroutine
         }
 
         continuation.invokeOnCancellation {
             if (serviceConnection === connection) {
-                runCatching {
-                    if (isAvailable()) Shizuku.unbindUserService(userServiceArgs, connection, false)
-                }
                 serviceConnection = null
+                runCatching {
+                    if (isAvailable()) {
+                        // remove=true terminates only FMZlinkR's own remote UserService process.
+                        Shizuku.unbindUserService(userServiceArgs, connection, true)
+                    }
+                }.onFailure {
+                    AppLogger.w("FMZlinkR cancelled UserService bind cleanup failed: ${it.message}", it)
+                }
             }
         }
     }
 
-    /** Unbinds only FMZlinkR's UserService; the Shizuku server remains untouched. */
+    /**
+     * Unbinds and removes only FMZlinkR's UserService. The Shizuku server and other apps remain untouched.
+     */
     fun unbind() {
         val connection = serviceConnection ?: return
         serviceConnection = null
         runCatching {
             if (isAvailable()) {
-                Shizuku.unbindUserService(userServiceArgs, connection, false)
-                AppLogger.i("FMZlinkR Shizuku UserService unbound")
+                Shizuku.unbindUserService(userServiceArgs, connection, true)
+                AppLogger.i("FMZlinkR Shizuku UserService removed")
             }
         }.onFailure {
-            AppLogger.w("FMZlinkR UserService unbind failed: ${it.message}", it)
+            AppLogger.w("FMZlinkR UserService remove failed: ${it.message}", it)
         }
     }
 }
