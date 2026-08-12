@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FMZlinkR theme derived from ShizuCallRecorder.
+  Copyright (C) 2026-present kitsumed (Med)
+  Copyright (C) 2026 fumizo07
+  Licensed under GNU GPL v3 or later with applicable Section 7 terms.
+-->
+<resources>
+    <style name="Theme.FMZlinkR" parent="Theme.AppCompat.NoActionBar" />
+</resources>
