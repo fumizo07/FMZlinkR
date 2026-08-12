@@ -21,6 +21,7 @@ import kotlin.system.exitProcess
 class ShellService : IShellService.Stub {
     @Volatile private var voipSession: VoipCaptureSession? = null
     @Volatile private var lastVoipFarPartyHeard = false
+    @Volatile private var lastVoipNearPartyHeard = false
 
     @Keep constructor() : this(null)
 
@@ -57,6 +58,7 @@ class ShellService : IShellService.Stub {
         return runCatching {
             session.start()
             lastVoipFarPartyHeard = false
+            lastVoipNearPartyHeard = false
             voipSession = session
             true
         }.onFailure {
@@ -72,9 +74,11 @@ class ShellService : IShellService.Stub {
         runCatching { session.stop() }
             .onFailure { AppLogger.e("VoIP dual capture stop failed: ${it.message}", it) }
         lastVoipFarPartyHeard = session.farPartyHeard
+        lastVoipNearPartyHeard = session.nearPartyHeard
     }
 
     override fun voipFarPartyHeard(): Boolean = voipSession?.farPartyHeard ?: lastVoipFarPartyHeard
+    override fun voipNearPartyHeard(): Boolean = voipSession?.nearPartyHeard ?: lastVoipNearPartyHeard
     override fun voipCallAppUid(): Int = VoipAppIdentity.currentVoiceCommUid()
 
     /** Special Shizuku destroy transaction. Exits only this app's UserService process. */
