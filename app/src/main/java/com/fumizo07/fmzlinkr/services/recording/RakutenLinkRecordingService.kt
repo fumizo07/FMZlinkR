@@ -30,8 +30,11 @@ import com.fumizo07.fmzlinkr.data.FmzPreferences
 import com.fumizo07.fmzlinkr.integrations.shizuku.ShizukuConnectionManager
 import com.fumizo07.fmzlinkr.system.storage.SafHelper
 import com.fumizo07.fmzlinkr.utils.AppLogger
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
@@ -104,6 +107,9 @@ class RakutenLinkRecordingService : Service() {
     @Volatile private var recording = false
     @Volatile private var startingRecording = false
     @Volatile private var callKind = CallKind.NONE
+    private var bindJob: Job? = null
+    private var monitoringGeneration = 0L
+    private var callGeneration = 0L
     private var currentUri: android.net.Uri? = null
 
     private val modePoll = object : Runnable {
@@ -127,11 +133,20 @@ class RakutenLinkRecordingService : Service() {
         createNotificationChannel()
         shizukuManager = ShizukuConnectionManager(this) {
             AppLogger.w("FMZlinkR lost its Shizuku UserService connection")
+            monitoringGeneration++
+            callGeneration++
+            bindJob?.cancel()
+            bindJob = null
             shellService = null
             armed = false
+            binding = false
             recording = false
             startingRecording = false
+            callActive = false
+            callKind = CallKind.NONE
             prefs.setMonitoringEnabled(false)
+            handler.removeCallbacks(modePoll)
+            handler.removeCallbacks(endRunnable)
             overlay.hide()
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
@@ -156,9 +171,13 @@ class RakutenLinkRecordingService : Service() {
     }
 
     private fun enableMonitoring() {
-        if (armed || binding) {
+        if (armed) {
             prefs.setMonitoringEnabled(true)
             refreshVisibleControls()
+            return
+        }
+        if (binding) {
+            prefs.setMonitoringEnabled(true)
             return
         }
 
@@ -172,56 +191,97 @@ class RakutenLinkRecordingService : Service() {
     }
 
     private fun bindAndArm() {
+        val generation = ++monitoringGeneration
         prefs.setMonitoringEnabled(true)
         binding = true
         updateNotification("Shizuku UserServiceへ接続中")
 
-        scope.launch {
-            val service = runCatching {
-                withContext(Dispatchers.IO) { shizukuManager.getShellService() }
-            }.onFailure {
-                AppLogger.e("FMZlinkR could not bind Shizuku UserService: ${it.message}", it)
-            }.getOrNull()
-            if (service == null) {
+        bindJob?.cancel()
+        bindJob = scope.launch {
+            var service: IShellService? = null
+            var armedByThisJob = false
+            try {
+                service = runCatching {
+                    withContext(Dispatchers.IO) { shizukuManager.getShellService() }
+                }.onFailure {
+                    if (it !is CancellationException) {
+                        AppLogger.e("FMZlinkR could not bind Shizuku UserService: ${it.message}", it)
+                    }
+                }.getOrNull()
+
+                if (!isMonitoringGenerationCurrent(generation)) return@launch
+                if (service == null) {
+                    failEnable("Shizuku UserServiceへ接続できません")
+                    return@launch
+                }
+
+                val didArm = runCatching {
+                    withContext(Dispatchers.IO) { service.armVoipCapture() }
+                }.onFailure {
+                    if (it !is CancellationException) {
+                        AppLogger.e("FMZlinkR AudioPolicy arm failed: ${it.message}", it)
+                    }
+                }.getOrDefault(false)
+                armedByThisJob = didArm
+
+                if (!isMonitoringGenerationCurrent(generation)) return@launch
+                if (!didArm) {
+                    failEnable("AudioPolicyを登録できませんでした")
+                    return@launch
+                }
+
+                shellService = service
+                armed = true
                 binding = false
-                failEnable("Shizuku UserServiceへ接続できません")
-                return@launch
-            }
-            shellService = service
+                lateArmCall = audioManager.mode == AudioManager.MODE_IN_COMMUNICATION
+                callActive = lateArmCall
+                callGeneration++
+                callKind = if (lateArmCall) CallKind.UNKNOWN else CallKind.NONE
+                handler.removeCallbacks(modePoll)
+                handler.post(modePoll)
 
-            val didArm = runCatching {
-                withContext(Dispatchers.IO) { service.armVoipCapture() }
-            }.onFailure {
-                AppLogger.e("FMZlinkR AudioPolicy arm failed: ${it.message}", it)
-            }.getOrDefault(false)
-            binding = false
-            if (!didArm) {
-                failEnable("AudioPolicyを登録できませんでした")
-                return@launch
-            }
-
-            armed = true
-            lateArmCall = audioManager.mode == AudioManager.MODE_IN_COMMUNICATION
-            callActive = lateArmCall
-            callKind = if (lateArmCall) CallKind.UNKNOWN else CallKind.NONE
-            handler.removeCallbacks(modePoll)
-            handler.post(modePoll)
-
-            if (lateArmCall) {
-                updateNotification("現在の通話には待機開始が遅いため、次の通話から録音できます")
-                AppLogger.w("FMZlinkR armed after the current VoIP track was created; current call skipped")
-            } else {
-                updateNotification("Rakuten Link録音待機中")
-                AppLogger.i("FMZlinkR ready: AudioPolicy armed before the next call")
+                if (lateArmCall) {
+                    updateNotification("現在の通話には待機開始が遅いため、次の通話から録音できます")
+                    AppLogger.w("FMZlinkR armed after the current VoIP track was created; current call skipped")
+                } else {
+                    updateNotification("Rakuten Link録音待機中")
+                    AppLogger.i("FMZlinkR ready: AudioPolicy armed before the next call")
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } finally {
+                val stillCurrent = isMonitoringGenerationCurrent(generation)
+                if (!stillCurrent) {
+                    if (armedByThisJob && service != null) {
+                        withContext(NonCancellable + Dispatchers.IO) {
+                            runCatching { service.disarmVoipCapture() }
+                        }
+                    }
+                    shizukuManager.unbind()
+                }
+                if (generation == monitoringGeneration) {
+                    binding = false
+                    bindJob = null
+                }
             }
         }
     }
 
+    private fun isMonitoringGenerationCurrent(generation: Long): Boolean =
+        generation == monitoringGeneration && prefs.isMonitoringEnabled()
+
     private fun failEnable(message: String) {
         AppLogger.e("FMZlinkR monitoring unavailable: $message")
+        monitoringGeneration++
+        callGeneration++
         prefs.setMonitoringEnabled(false)
+        bindJob = null
         armed = false
         binding = false
+        shellService = null
+        callActive = false
+        callKind = CallKind.NONE
+        shizukuManager.unbind()
         updateNotification(message)
         handler.postDelayed({
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -230,7 +290,11 @@ class RakutenLinkRecordingService : Service() {
     }
 
     private fun disableMonitoring() {
+        monitoringGeneration++
+        callGeneration++
         prefs.setMonitoringEnabled(false)
+        bindJob?.cancel()
+        bindJob = null
         handler.removeCallbacks(modePoll)
         handler.removeCallbacks(endRunnable)
         overlay.hide()
@@ -238,6 +302,7 @@ class RakutenLinkRecordingService : Service() {
         val service = shellService
         shellService = null
         armed = false
+        binding = false
         callActive = false
         lateArmCall = false
         recording = false
@@ -265,7 +330,8 @@ class RakutenLinkRecordingService : Service() {
             if (!callActive) {
                 callActive = true
                 callKind = CallKind.CHECKING
-                scope.launch { handleCallStarted() }
+                val generation = ++callGeneration
+                scope.launch { handleCallStarted(generation) }
             }
         } else if (callActive) {
             handler.removeCallbacks(endRunnable)
@@ -273,7 +339,7 @@ class RakutenLinkRecordingService : Service() {
         }
     }
 
-    private suspend fun handleCallStarted() {
+    private suspend fun handleCallStarted(generation: Long) {
         if (lateArmCall) return
         val service = shellService ?: return
         updateNotification("VoIP通話を確認中")
@@ -286,6 +352,17 @@ class RakutenLinkRecordingService : Service() {
         }.onFailure {
             AppLogger.w("FMZlinkR could not resolve VoIP owner uid: ${it.message}")
         }.getOrDefault(-1)
+
+        if (
+            generation != callGeneration ||
+            !callActive ||
+            audioManager.mode != AudioManager.MODE_IN_COMMUNICATION ||
+            !armed ||
+            service !== shellService
+        ) {
+            AppLogger.d("FMZlinkR discarded stale VoIP classification result")
+            return
+        }
 
         callKind = when {
             ownerUid < 0 -> CallKind.UNKNOWN
@@ -315,6 +392,7 @@ class RakutenLinkRecordingService : Service() {
 
     private suspend fun handleCallEnded() {
         if (!callActive) return
+        callGeneration++
         if (recording || startingRecording) stopRecording(keepControls = false)
         callActive = false
         lateArmCall = false
@@ -362,7 +440,11 @@ class RakutenLinkRecordingService : Service() {
             return
         }
 
-        if (!callActive || audioManager.mode != AudioManager.MODE_IN_COMMUNICATION) {
+        if (
+            !callActive ||
+            audioManager.mode != AudioManager.MODE_IN_COMMUNICATION ||
+            service !== shellService
+        ) {
             runCatching { withContext(Dispatchers.IO) { service.stopVoipRecording() } }
             runCatching { DocumentFile.fromSingleUri(this, saf.uri)?.delete() }
             return
@@ -384,6 +466,11 @@ class RakutenLinkRecordingService : Service() {
             runCatching { withContext(Dispatchers.IO) { service.stopVoipRecording() } }
                 .onFailure { AppLogger.e("FMZlinkR VoIP stop failed: ${it.message}", it) }
         }
+        val nearHeard = if (service != null) {
+            runCatching { withContext(Dispatchers.IO) { service.voipNearPartyHeard() } }.getOrDefault(false)
+        } else {
+            false
+        }
         val farHeard = if (service != null) {
             runCatching { withContext(Dispatchers.IO) { service.voipFarPartyHeard() } }.getOrDefault(false)
         } else {
@@ -393,11 +480,17 @@ class RakutenLinkRecordingService : Service() {
         val uri = currentUri
         currentUri = null
         val size = uri?.let { DocumentFile.fromSingleUri(this, it)?.length() } ?: -1L
-        AppLogger.i("FMZlinkR Rakuten Link recording stopped: size=$size farPartyHeard=$farHeard")
+        AppLogger.i(
+            "FMZlinkR Rakuten Link recording stopped: size=$size nearPartyHeard=$nearHeard farPartyHeard=$farHeard",
+        )
 
         if (keepControls && callActive) {
             refreshVisibleControls()
-            if (!farHeard) updateNotification("録音停止。相手側音声を検出できませんでした")
+            when {
+                !nearHeard && !farHeard -> updateNotification("録音停止。自分側・相手側とも音声を検出できませんでした")
+                !nearHeard -> updateNotification("録音停止。自分側音声を検出できませんでした")
+                !farHeard -> updateNotification("録音停止。相手側音声を検出できませんでした")
+            }
         } else {
             overlay.hide()
         }
@@ -495,12 +588,16 @@ class RakutenLinkRecordingService : Service() {
     }
 
     override fun onDestroy() {
+        monitoringGeneration++
+        callGeneration++
+        bindJob?.cancel()
+        bindJob = null
         handler.removeCallbacks(modePoll)
         handler.removeCallbacks(endRunnable)
         overlay.hide()
 
-        // This is the fallback for Android destroying the service without ACTION_DISABLE. Do it
-        // deterministically before cancelling our coroutine scope or unbinding the UserService.
+        // Fallback for Android destroying the service without ACTION_DISABLE. Do cleanup before
+        // cancelling the coroutine scope or removing FMZlinkR's own UserService.
         val service = shellService
         shellService = null
         if (service != null) {
