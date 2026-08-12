@@ -102,12 +102,14 @@ internal object VoipAppIdentity {
                 process.inputStream.bufferedReader().use { reader ->
                     while (true) {
                         val line = reader.readLine() ?: break
-                        if (output.length < DUMP_MAX_CHARS) {
-                            val remaining = DUMP_MAX_CHARS - output.length
-                            if (line.length + 1 <= remaining) {
-                                output.append(line).append('\n')
-                            } else if (remaining > 0) {
-                                output.append(line, 0, minOf(line.length, remaining))
+                        synchronized(output) {
+                            if (output.length < DUMP_MAX_CHARS) {
+                                val remaining = DUMP_MAX_CHARS - output.length
+                                if (line.length + 1 <= remaining) {
+                                    output.append(line).append('\n')
+                                } else if (remaining > 0) {
+                                    output.append(line, 0, minOf(line.length, remaining))
+                                }
                             }
                         }
                     }
@@ -129,7 +131,7 @@ internal object VoipAppIdentity {
                 runCatching { process.waitFor(500L, TimeUnit.MILLISECONDS) }
             }
             runCatching { readerThread.join(DUMP_READER_JOIN_MS) }
-            output.toString().takeIf { it.isNotBlank() }
+            synchronized(output) { output.toString() }.takeIf { it.isNotBlank() }
         } finally {
             if (process.isAlive) runCatching { process.destroyForcibly() }
             if (readerThread.isAlive) readerThread.interrupt()
