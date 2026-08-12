@@ -1,0 +1,280 @@
+name: Build FMZlinkR APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_target:
+        description: "APK build target"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - official
+      runner_target:
+        description: "Build runner"
+        required: true
+        default: "github-hosted"
+        type: choice
+        options:
+          - github-hosted
+          - office-windows
+
+permissions:
+  contents: write
+
+env:
+  GH_REPO: ${{ github.repository }}
+  GH_PROMPT_DISABLED: 1
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner_target == 'office-windows' && 'office-windows-android' || 'ubuntu-latest' }}
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 20
+
+      - name: Select build configuration
+        run: |
+          $ErrorActionPreference = "Stop"
+          $target = "${{ inputs.build_target }}"
+          $branch = $env:GITHUB_REF_NAME
+          $runnerTarget = "${{ inputs.runner_target }}"
+
+          switch ($target) {
+            "dev" {
+              if ($branch -ne "dev") { throw "dev build must be run from dev. Current branch: $branch" }
+              "GRADLE_TASK=assembleDebug" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+              "APK_SEARCH_DIR=app/build/outputs/apk/debug" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+              "APK_FILE_NAME=FMZlinkR-dev.apk" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+              "RELEASE_PREFIX=FMZlinkR-dev" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+              "RELEASE_TITLE_PREFIX=FMZlinkR Dev" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+              "IS_PRERELEASE=true" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+              "SKIP_SIGNING=true" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+            }
+            "official" {
+              if ($branch -ne "main") { throw "official build must be run from main. Current branch: $branch" }
+              "GRADLE_TASK=assembleRelease" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+              "APK_SEARCH_DIR=app/build/outputs/apk/release" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+              "APK_FILE_NAME=FMZlinkR-release.apk" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+              "RELEASE_PREFIX=FMZlinkR" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+              "RELEASE_TITLE_PREFIX=FMZlinkR" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+              "IS_PRERELEASE=false" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+              "SKIP_SIGNING=false" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+            }
+            default { throw "Unknown build target: $target" }
+          }
+
+          switch ($runnerTarget) {
+            "github-hosted" {
+              "GRADLEW=./gradlew" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+              "CURL_COMMAND=curl" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+            }
+            "office-windows" {
+              "GRADLEW=.\\gradlew.bat" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+              "CURL_COMMAND=curl.exe" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+            }
+            default { throw "Unknown runner target: $runnerTarget" }
+          }
+
+          "BUILD_TARGET=$target" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "RUNNER_TARGET=$runnerTarget" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Setup Java 17 on GitHub-hosted runner
+        if: ${{ inputs.runner_target == 'github-hosted' }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Check office runner base tools
+        if: ${{ inputs.runner_target == 'office-windows' }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($command in @("java", "gh", "curl.exe")) {
+            if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
+              throw "$command is not available on office-windows-android."
+            }
+          }
+          if (-not $env:ANDROID_HOME -and -not $env:ANDROID_SDK_ROOT) {
+            throw "ANDROID_HOME or ANDROID_SDK_ROOT is not set."
+          }
+          java -version
+
+      - name: Check GitHub-hosted base tools
+        if: ${{ inputs.runner_target == 'github-hosted' }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($command in @("java", "gh", "curl")) {
+            if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
+              throw "$command is not available on ubuntu-latest."
+            }
+          }
+          if (-not $env:ANDROID_HOME -and -not $env:ANDROID_SDK_ROOT) {
+            throw "ANDROID_HOME or ANDROID_SDK_ROOT is not set on ubuntu-latest."
+          }
+          java -version
+
+      # The repository does not track gradlew/gradlew.bat or gradle-wrapper.jar.
+      # Install exactly Gradle 9.4.1 without Actions cache, then generate a temporary
+      # wrapper for the current Linux or Windows runner.
+      - name: Setup Gradle 9.4.1
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: "9.4.1"
+          cache-disabled: true
+
+      - name: Generate missing Gradle wrapper
+        env:
+          SKIP_SIGNING: "true"
+        run: |
+          $ErrorActionPreference = "Stop"
+          gradle wrapper --no-daemon --console=plain
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          if ($env:RUNNER_TARGET -eq "github-hosted") {
+            if (-not (Test-Path "./gradlew")) { throw "gradlew was not generated." }
+            & chmod +x ./gradlew
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            if (-not (Test-Path ".\gradlew.bat")) { throw "gradlew.bat was not generated." }
+          }
+          if (-not (Test-Path "./gradle/wrapper/gradle-wrapper.jar")) { throw "gradle-wrapper.jar was not generated." }
+
+          & $env:GRADLEW --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Decode official release keystore
+        if: ${{ inputs.build_target == 'official' }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $encoded = "${{ secrets.SIGNING_KEYSTORE }}".Trim()
+          if ([string]::IsNullOrWhiteSpace($encoded)) { throw "SIGNING_KEYSTORE secret is empty." }
+          $keystorePath = Join-Path $env:GITHUB_WORKSPACE "release-keystore.jks"
+          [System.IO.File]::WriteAllBytes(
+            $keystorePath,
+            [System.Convert]::FromBase64String($encoded)
+          )
+          "KEYSTORE_FILE=$keystorePath" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Read FMZlinkR version
+        env:
+          SKIP_SIGNING: "true"
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:GRADLEW writeVersionForCi --no-daemon --console=plain
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = (Get-Content "app/build/outputs/version.txt" -Raw).Trim()
+          if ([string]::IsNullOrWhiteSpace($version)) { throw "versionName is empty." }
+          "APP_VERSION=$version" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build APK
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:GRADLEW $env:GRADLE_TASK --no-daemon --console=plain --stacktrace
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Prepare Release asset
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (Test-Path "release-assets") { Remove-Item "release-assets" -Recurse -Force }
+          New-Item -ItemType Directory -Path "release-assets" | Out-Null
+          $apks = @(Get-ChildItem -Path $env:APK_SEARCH_DIR -Filter "*.apk" -File)
+          if ($apks.Count -ne 1) {
+            $apks | ForEach-Object { Write-Host $_.FullName }
+            throw "Expected exactly one APK in $env:APK_SEARCH_DIR, found $($apks.Count)."
+          }
+          Copy-Item $apks[0].FullName (Join-Path "release-assets" $env:APK_FILE_NAME) -Force
+          $asset = Get-Item (Join-Path "release-assets" $env:APK_FILE_NAME)
+          Write-Host "$($asset.Name): $([Math]::Round($asset.Length / 1MB, 2)) MB"
+
+      - name: Set Release metadata
+        run: |
+          $ErrorActionPreference = "Stop"
+          $shortSha = "${{ github.sha }}".Substring(0, 7)
+          $utcNow = [DateTime]::UtcNow
+          $jstNow = [TimeZoneInfo]::ConvertTimeBySystemTimeZoneId($utcNow, "Tokyo Standard Time")
+          $stamp = $jstNow.ToString("yyyyMMdd-HHmmss")
+          $displayTime = $jstNow.ToString("yyyy-MM-dd HH:mm:ss 'JST'")
+          $tag = "$($env:RELEASE_PREFIX)-v$($env:APP_VERSION)-$stamp-$shortSha-${{ github.run_id }}"
+          "RELEASE_TAG=$tag" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "RELEASE_TIME=$displayTime" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "SHORT_SHA=$shortSha" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Create GitHub Release
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $title = "$($env:RELEASE_TITLE_PREFIX) v$($env:APP_VERSION) - $($env:RELEASE_TIME) ($($env:SHORT_SHA))"
+          $args = @(
+            "release", "create", $env:RELEASE_TAG,
+            "--repo", $env:GH_REPO,
+            "--title", $title,
+            "--notes", "FMZlinkR $($env:BUILD_TARGET) APK built on $($env:RUNNER_TARGET) from commit ${{ github.sha }}.",
+            "--target", "${{ github.sha }}",
+            "--latest=false"
+          )
+          if ($env:IS_PRERELEASE -eq "true") { $args += "--prerelease" }
+          & gh @args
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "RELEASE_CREATED=1" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload APK directly to GitHub Release
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $apkPath = (Resolve-Path (Join-Path "release-assets" $env:APK_FILE_NAME)).Path
+          $assetName = [System.Uri]::EscapeDataString($env:APK_FILE_NAME)
+          $releaseJson = & gh api "repos/$env:GH_REPO/releases/tags/$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $release = $releaseJson | ConvertFrom-Json
+          $uploadBase = $release.upload_url -replace "\{\?name,label\}$", ""
+          if ([string]::IsNullOrWhiteSpace($uploadBase)) { throw "Release upload URL is empty." }
+          $uploadUrl = "${uploadBase}?name=$assetName"
+
+          $curlArgs = @(
+            "--fail", "--show-error", "--location", "--http1.1", "--ipv4",
+            "-X", "POST",
+            "-H", ("Authorization: Bearer " + $env:GH_TOKEN),
+            "-H", "Accept: application/vnd.github+json",
+            "-H", "X-GitHub-Api-Version: 2022-11-28",
+            "-H", "Content-Type: application/vnd.android.package-archive",
+            "-H", "Expect:",
+            "--data-binary", "@$apkPath",
+            $uploadUrl
+          )
+          & $env:CURL_COMMAND @curlArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Cleanup incomplete Release
+        if: failure() && env.RELEASE_CREATED == '1'
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          & gh release delete $env:RELEASE_TAG --repo $env:GH_REPO --yes --cleanup-tag
+
+      - name: Cleanup generated/signing files
+        if: always()
+        run: |
+          Remove-Item (Join-Path $env:GITHUB_WORKSPACE "release-keystore.jks") -Force -ErrorAction SilentlyContinue
+          Remove-Item (Join-Path $env:GITHUB_WORKSPACE "gradlew") -Force -ErrorAction SilentlyContinue
+          Remove-Item (Join-Path $env:GITHUB_WORKSPACE "gradlew.bat") -Force -ErrorAction SilentlyContinue
+          Remove-Item (Join-Path $env:GITHUB_WORKSPACE "gradle/wrapper/gradle-wrapper.jar") -Force -ErrorAction SilentlyContinue
