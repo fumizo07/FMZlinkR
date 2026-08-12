@@ -5,6 +5,7 @@ plugins {
 
 val isEnvironmentGithubCI = providers.environmentVariable("GITHUB_ACTIONS").isPresent
 val shouldSkipSigning = providers.environmentVariable("SKIP_SIGNING").orNull?.toBoolean() ?: false
+val useCiSigning = isEnvironmentGithubCI && !shouldSkipSigning
 
 tasks.register("writeVersionForCi") {
     val outputFile = layout.buildDirectory.file("outputs/version.txt")
@@ -30,8 +31,8 @@ android {
     }
 
     signingConfigs {
-        create("ci-release") {
-            if (isEnvironmentGithubCI && !shouldSkipSigning) {
+        create("ci-stable") {
+            if (useCiSigning) {
                 storeFile = file(
                     System.getenv("KEYSTORE_FILE")
                         ?: throw GradleException("Keystore file not provided. env: KEYSTORE_FILE")
@@ -47,6 +48,13 @@ android {
     }
 
     buildTypes {
+        debug {
+            // GitHub-hosted runners are ephemeral, so their default debug.keystore changes.
+            // CI uses the repository signing secret to keep dev APK upgrades installable.
+            if (useCiSigning) {
+                signingConfig = signingConfigs.getByName("ci-stable")
+            }
+        }
         release {
             isMinifyEnabled = true
             isShrinkResources = true
@@ -54,8 +62,8 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
-            if (isEnvironmentGithubCI && !shouldSkipSigning) {
-                signingConfig = signingConfigs.getByName("ci-release")
+            if (useCiSigning) {
+                signingConfig = signingConfigs.getByName("ci-stable")
             }
         }
     }
