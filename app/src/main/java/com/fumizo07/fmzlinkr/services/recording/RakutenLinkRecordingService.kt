@@ -16,6 +16,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.AudioManager
+import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -107,10 +108,11 @@ class RakutenLinkRecordingService : Service() {
     @Volatile private var recording = false
     @Volatile private var startingRecording = false
     @Volatile private var callKind = CallKind.NONE
+
     private var bindJob: Job? = null
     private var monitoringGeneration = 0L
     private var callGeneration = 0L
-    private var currentUri: android.net.Uri? = null
+    private var currentUri: Uri? = null
 
     private val modePoll = object : Runnable {
         override fun run() {
@@ -143,7 +145,9 @@ class RakutenLinkRecordingService : Service() {
             recording = false
             startingRecording = false
             callActive = false
+            lateArmCall = false
             callKind = CallKind.NONE
+            currentUri = null
             prefs.setMonitoringEnabled(false)
             handler.removeCallbacks(modePoll)
             handler.removeCallbacks(endRunnable)
@@ -198,10 +202,9 @@ class RakutenLinkRecordingService : Service() {
 
         bindJob?.cancel()
         bindJob = scope.launch {
-            var service: IShellService? = null
-            var armedByThisJob = false
+            var boundService: IShellService? = null
             try {
-                service = runCatching {
+                val service = runCatching {
                     withContext(Dispatchers.IO) { shizukuManager.getShellService() }
                 }.onFailure {
                     if (it !is CancellationException) {
@@ -209,6 +212,7 @@ class RakutenLinkRecordingService : Service() {
                     }
                 }.getOrNull()
 
+                boundService = service
                 if (!isMonitoringGenerationCurrent(generation)) return@launch
                 if (service == null) {
                     failEnable("Shizuku UserServiceへ接続できません")
@@ -222,7 +226,6 @@ class RakutenLinkRecordingService : Service() {
                         AppLogger.e("FMZlinkR AudioPolicy arm failed: ${it.message}", it)
                     }
                 }.getOrDefault(false)
-                armedByThisJob = didArm
 
                 if (!isMonitoringGenerationCurrent(generation)) return@launch
                 if (!didArm) {
@@ -252,9 +255,13 @@ class RakutenLinkRecordingService : Service() {
             } finally {
                 val stillCurrent = isMonitoringGenerationCurrent(generation)
                 if (!stillCurrent) {
-                    if (armedByThisJob && service != null) {
+                    // The remote call may have armed the policy just as this coroutine was cancelled.
+                    // Always disarm a stale bound service instead of relying on a local success flag.
+                    val staleService = boundService
+                    if (staleService != null) {
                         withContext(NonCancellable + Dispatchers.IO) {
-                            runCatching { service.disarmVoipCapture() }
+                            runCatching { staleService.stopVoipRecording() }
+                            runCatching { staleService.disarmVoipCapture() }
                         }
                     }
                     shizukuManager.unbind()
@@ -280,7 +287,9 @@ class RakutenLinkRecordingService : Service() {
         binding = false
         shellService = null
         callActive = false
+        lateArmCall = false
         callKind = CallKind.NONE
+        currentUri = null
         shizukuManager.unbind()
         updateNotification(message)
         handler.postDelayed({
@@ -408,6 +417,7 @@ class RakutenLinkRecordingService : Service() {
         if (!manual && callKind != CallKind.RAKUTEN) return
 
         val service = shellService ?: return
+        val generation = callGeneration
         val folder = prefs.getRecordingFolderUri() ?: return
         if (!SafHelper.isFolderValid(this, folder)) {
             updateNotification("録音保存先へ書き込めません")
@@ -441,6 +451,7 @@ class RakutenLinkRecordingService : Service() {
         }
 
         if (
+            generation != callGeneration ||
             !callActive ||
             audioManager.mode != AudioManager.MODE_IN_COMMUNICATION ||
             service !== shellService
