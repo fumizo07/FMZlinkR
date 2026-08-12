@@ -1,5 +1,6 @@
-# Gradle / Android build output
+# Gradle / Android / Kotlin build output
 .gradle/
+.kotlin/
 build/
 **/build/
 
