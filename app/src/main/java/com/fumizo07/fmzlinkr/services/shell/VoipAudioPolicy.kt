@@ -83,7 +83,7 @@ internal object VoipAudioPolicy {
             AppLogger.i("VoIP AudioPolicy armed: USAGE_VOICE_COMMUNICATION loopback-render ${SAMPLE_RATE}Hz")
             true
         }.onFailure {
-            AppLogger.e("VoIP AudioPolicy arm failed: ${it.message}", it)
+            AppLogger.e("VoIP AudioPolicy arm failed: ${describeThrowable(it)}", it)
         }.getOrDefault(false)
     }
 
@@ -101,25 +101,51 @@ internal object VoipAudioPolicy {
                 .apply { isAccessible = true }
                 .invoke(null, current)
             AppLogger.i("VoIP AudioPolicy disarmed")
-        }.onFailure { AppLogger.w("VoIP AudioPolicy disarm failed: ${it.message}", it) }
+        }.onFailure { AppLogger.w("VoIP AudioPolicy disarm failed: ${describeThrowable(it)}", it) }
     }
 
     @Synchronized
     fun createSink(): AudioRecord? {
-        val currentPolicy = policy ?: return null
-        val currentMix = mix ?: return null
+        val currentPolicy = policy ?: run {
+            AppLogger.w("VoIP far-party sink requested with no armed AudioPolicy")
+            return null
+        }
+        val currentMix = mix ?: run {
+            AppLogger.w("VoIP far-party sink requested with no AudioMix")
+            return null
+        }
+        AppLogger.i("VoIP far-party sink creation requested uid=${android.os.Process.myUid()}")
         return runCatching {
             val policyClass = Class.forName("android.media.audiopolicy.AudioPolicy")
             val mixClass = Class.forName("android.media.audiopolicy.AudioMix")
             val record = policyClass.getMethod("createAudioRecordSink", mixClass)
                 .invoke(currentPolicy, currentMix) as AudioRecord?
             if (record == null || record.state != AudioRecord.STATE_INITIALIZED) {
+                val state = record?.state
                 runCatching { record?.release() }
-                AppLogger.w("VoIP far-party sink failed to initialise (state=${record?.state})")
+                AppLogger.w("VoIP far-party sink failed to initialise (state=$state)")
                 null
-            } else record
+            } else {
+                AppLogger.i("VoIP far-party sink initialised successfully")
+                record
+            }
         }.onFailure {
-            AppLogger.e("VoIP far-party sink creation failed: ${it.message}", it)
+            AppLogger.e("VoIP far-party sink creation failed: ${describeThrowable(it)}", it)
         }.getOrNull()
+    }
+
+    private fun describeThrowable(throwable: Throwable): String {
+        var root = throwable
+        val seen = HashSet<Throwable>()
+        while (root.cause != null && root.cause !== root && seen.add(root)) {
+            root = root.cause!!
+        }
+        val rootName = root::class.java.name
+        val rootMessage = root.message?.takeIf { it.isNotBlank() } ?: "(no message)"
+        return if (root === throwable) {
+            "$rootName: $rootMessage"
+        } else {
+            "${throwable::class.java.name} -> $rootName: $rootMessage"
+        }
     }
 }
