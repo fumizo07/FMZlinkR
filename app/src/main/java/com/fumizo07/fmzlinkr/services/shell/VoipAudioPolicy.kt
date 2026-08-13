@@ -65,7 +65,7 @@ internal object VoipAudioPolicy {
 
             val policyClass = Class.forName("android.media.audiopolicy.AudioPolicy")
             val policyBuilderClass = Class.forName("android.media.audiopolicy.AudioPolicy\$Builder")
-            // Null Context is intentional for the shell-uid attribution path used by CallVault.
+            // Null Context is intentional and matches the proven CallVault audio-policy path.
             val policyBuilder = policyBuilderClass
                 .getConstructor(Context::class.java)
                 .newInstance(*arrayOf<Any?>(null))
@@ -123,79 +123,23 @@ internal object VoipAudioPolicy {
         return runCatching {
             val policyClass = Class.forName("android.media.audiopolicy.AudioPolicy")
             val mixClass = Class.forName("android.media.audiopolicy.AudioMix")
-            val record = policyClass.getMethod("createAudioRecordSink", mixClass)
-                .invoke(currentPolicy, currentMix) as AudioRecord?
-
-            if (record == null) {
-                AppLogger.w("VoIP far-party sink creation returned null")
-                return@runCatching null
+            val record = ShellAudioAttribution.withoutClientApplication("far-party sink") {
+                policyClass.getMethod("createAudioRecordSink", mixClass)
+                    .invoke(currentPolicy, currentMix) as AudioRecord?
             }
-            if (record.state == AudioRecord.STATE_INITIALIZED) {
-                AppLogger.i("VoIP far-party sink initialised successfully")
-                return@runCatching record
-            }
-
-            val failedState = record.state
-            AppLogger.w(
-                "VoIP standard far-party sink is uninitialised (state=$failedState); " +
-                    "retrying with null-Context AudioRecord.Builder",
-            )
-            val fallback = createNullContextSink(record)
-            runCatching { record.release() }
-
-            if (fallback == null || fallback.state != AudioRecord.STATE_INITIALIZED) {
-                val fallbackState = fallback?.state
-                runCatching { fallback?.release() }
-                AppLogger.w("VoIP null-Context far-party sink failed to initialise (state=$fallbackState)")
+            if (record == null || record.state != AudioRecord.STATE_INITIALIZED) {
+                val state = record?.state
+                runCatching { record?.release() }
+                AppLogger.w("VoIP far-party sink failed to initialise with shell attribution (state=$state)")
                 null
             } else {
-                AppLogger.i("VoIP null-Context far-party sink initialised successfully")
-                fallback
+                AppLogger.i("VoIP far-party sink initialised successfully with shell attribution")
+                record
             }
         }.onFailure {
             AppLogger.e("VoIP far-party sink creation failed: ${describeThrowable(it)}", it)
         }.getOrNull()
     }
-
-    /**
-     * Shizuku UserService creates an Application object for the client package while the process still
-     * runs as shell uid 2000. AudioPolicy.createAudioRecordSink() eventually calls the public
-     * AudioRecord constructor, which automatically uses ActivityThread.currentApplication() as its
-     * attribution Context. On devices that reject a shell uid + app-package attribution pair, that
-     * leaves the AudioRecord in STATE_UNINITIALIZED.
-     *
-     * AudioRecord.Builder keeps its Context null unless setContext() is called. Reuse the framework
-     * sink's REMOTE_SUBMIX attributes and input format, but rebuild it through a Builder whose Context
-     * remains null. That selects the command-line/shell attribution path without a private constructor,
-     * a daemon, or any Shizuku/adbd lifecycle changes.
-     */
-    private fun createNullContextSink(template: AudioRecord): AudioRecord? = runCatching {
-        val attributes = AudioRecord::class.java
-            .getMethod("getAudioAttributes")
-            .invoke(template) as AudioAttributes
-        val format = template.format
-        // Match AudioPolicy.createAudioRecordSink(): it deliberately uses stereo for the minimum
-        // buffer-size query even when the actual sink format is mono, due to channel-mask support.
-        val bufferSize = AudioRecord.getMinBufferSize(
-            format.sampleRate,
-            AudioFormat.CHANNEL_IN_STEREO,
-            format.encoding,
-        )
-        if (bufferSize <= 0) {
-            throw IllegalStateException("VoIP null-Context sink minBufferSize=$bufferSize")
-        }
-
-        val builder = AudioRecord.Builder()
-        AudioRecord.Builder::class.java
-            .getMethod("setAudioAttributes", AudioAttributes::class.java)
-            .invoke(builder, attributes)
-        builder
-            .setAudioFormat(format)
-            .setBufferSizeInBytes(bufferSize)
-            .build()
-    }.onFailure {
-        AppLogger.e("VoIP null-Context sink construction failed: ${describeThrowable(it)}", it)
-    }.getOrNull()
 
     private fun describeThrowable(throwable: Throwable): String {
         var root = throwable
