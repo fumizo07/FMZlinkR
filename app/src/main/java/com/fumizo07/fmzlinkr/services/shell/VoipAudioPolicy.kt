@@ -10,7 +10,6 @@ package com.fumizo07.fmzlinkr.services.shell
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
-import android.media.AudioManager
 import android.media.AudioRecord
 import android.os.Binder
 import com.fumizo07.fmzlinkr.utils.AppLogger
@@ -139,7 +138,7 @@ internal object VoipAudioPolicy {
             val failedState = record.state
             AppLogger.w(
                 "VoIP standard far-party sink is uninitialised (state=$failedState); " +
-                    "retrying with explicit null Context attribution",
+                    "retrying with null-Context AudioRecord.Builder",
             )
             val fallback = createNullContextSink(record)
             runCatching { record.release() }
@@ -165,9 +164,10 @@ internal object VoipAudioPolicy {
      * attribution Context. On devices that reject a shell uid + app-package attribution pair, that
      * leaves the AudioRecord in STATE_UNINITIALIZED.
      *
-     * Recreate the exact failed sink parameters through AudioRecord's internal constructor but pass a
-     * null Context explicitly. This matches the command-line/shell attribution path without starting a
-     * daemon or altering Shizuku/adbd. The standard framework path is always attempted first.
+     * AudioRecord.Builder keeps its Context null unless setContext() is called. Reuse the framework
+     * sink's REMOTE_SUBMIX attributes and input format, but rebuild it through a Builder whose Context
+     * remains null. That selects the command-line/shell attribution path without a private constructor,
+     * a daemon, or any Shizuku/adbd lifecycle changes.
      */
     private fun createNullContextSink(template: AudioRecord): AudioRecord? = runCatching {
         val attributes = AudioRecord::class.java
@@ -183,25 +183,14 @@ internal object VoipAudioPolicy {
             throw IllegalStateException("VoIP null-Context sink minBufferSize=$bufferSize")
         }
 
-        val constructor = AudioRecord::class.java.getDeclaredConstructor(
-            AudioAttributes::class.java,
-            AudioFormat::class.java,
-            Int::class.javaPrimitiveType,
-            Int::class.javaPrimitiveType,
-            Context::class.java,
-            Int::class.javaPrimitiveType,
-            Int::class.javaPrimitiveType,
-        ).apply { isAccessible = true }
-
-        constructor.newInstance(
-            attributes,
-            format,
-            bufferSize,
-            AudioManager.AUDIO_SESSION_ID_GENERATE,
-            null,
-            0,
-            0,
-        ) as AudioRecord
+        val builder = AudioRecord.Builder()
+        AudioRecord.Builder::class.java
+            .getMethod("setAudioAttributes", AudioAttributes::class.java)
+            .invoke(builder, attributes)
+        builder
+            .setAudioFormat(format)
+            .setBufferSizeInBytes(bufferSize)
+            .build()
     }.onFailure {
         AppLogger.e("VoIP null-Context sink construction failed: ${describeThrowable(it)}", it)
     }.getOrNull()
