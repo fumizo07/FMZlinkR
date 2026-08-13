@@ -6,8 +6,11 @@
 package com.fumizo07.fmzlinkr.ui.screens
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
@@ -22,6 +25,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -38,6 +42,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -47,6 +52,7 @@ import com.fumizo07.fmzlinkr.data.FmzPreferences
 import com.fumizo07.fmzlinkr.integrations.shizuku.ShizukuConnectionManager
 import com.fumizo07.fmzlinkr.services.recording.RakutenLinkRecordingService
 import com.fumizo07.fmzlinkr.system.storage.SafHelper
+import com.fumizo07.fmzlinkr.utils.AppLogger
 
 private const val UPSTREAM_REPO_URL = "https://github.com/kitsumed/ShizuCallRecorder"
 private const val CALLVAULT_REPO_URL = "https://github.com/madkongo/CallVault"
@@ -69,6 +75,8 @@ fun FmzSettingsScreen() {
     val rakutenInstalled = runCatching {
         context.packageManager.getApplicationInfo("jp.co.rakuten.mobile.rcs", 0)
     }.isSuccess
+    val audioMode = context.getSystemService(AudioManager::class.java).mode
+    val diagnosticText = AppLogger.diagnosticSnapshot()
 
     val folderLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri != null) {
@@ -193,6 +201,47 @@ fun FmzSettingsScreen() {
         }
 
         Card(modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("実機診断", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Text(
+                    "AudioManager mode: $audioMode (${audioModeLabel(audioMode)}) / 録音待機設定: ${if (prefs.isMonitoringEnabled()) "ON" else "OFF"}",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    "通話テスト後に『更新』を押し、ログをコピーして共有してください。Shizuku UserService側のAudioPolicy・AudioRecord例外もここへ転送されます。",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = { revision++ }) {
+                        Text("更新")
+                    }
+                    OutlinedButton(onClick = {
+                        val text = AppLogger.diagnosticSnapshot()
+                        context.getSystemService(ClipboardManager::class.java).setPrimaryClip(
+                            ClipData.newPlainText("FMZlinkR diagnostics", text),
+                        )
+                        revision++
+                    }) {
+                        Text("ログをコピー")
+                    }
+                    OutlinedButton(onClick = {
+                        AppLogger.clearDiagnostics()
+                        revision++
+                    }) {
+                        Text("消去")
+                    }
+                }
+                SelectionContainer {
+                    Text(
+                        diagnosticText.ifBlank { "まだ診断ログはありません。録音待機をONにして通話テストを行ってください。" },
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                }
+            }
+        }
+
+        Card(modifier = Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("使い方", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                 Text("1. Shizukuをユーザー自身で起動します。")
@@ -226,6 +275,15 @@ fun FmzSettingsScreen() {
             }
         }
     }
+}
+
+private fun audioModeLabel(mode: Int): String = when (mode) {
+    AudioManager.MODE_NORMAL -> "NORMAL"
+    AudioManager.MODE_RINGTONE -> "RINGTONE"
+    AudioManager.MODE_IN_CALL -> "IN_CALL"
+    AudioManager.MODE_IN_COMMUNICATION -> "IN_COMMUNICATION"
+    AudioManager.MODE_CALL_SCREENING -> "CALL_SCREENING"
+    else -> "UNKNOWN"
 }
 
 @Composable
