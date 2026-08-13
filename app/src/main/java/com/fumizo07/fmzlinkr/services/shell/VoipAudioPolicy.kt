@@ -10,6 +10,7 @@ package com.fumizo07.fmzlinkr.services.shell
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioRecord
+import android.os.Binder
 import com.fumizo07.fmzlinkr.utils.AppLogger
 import java.lang.reflect.Constructor
 
@@ -114,7 +115,10 @@ internal object VoipAudioPolicy {
             AppLogger.w("VoIP far-party sink requested with no AudioMix")
             return null
         }
-        AppLogger.i("VoIP far-party sink creation requested uid=${android.os.Process.myUid()}")
+        AppLogger.i(
+            "VoIP far-party sink creation requested uid=${android.os.Process.myUid()} " +
+                "callingUid=${Binder.getCallingUid()}",
+        )
         return runCatching {
             val policyClass = Class.forName("android.media.audiopolicy.AudioPolicy")
             val mixClass = Class.forName("android.media.audiopolicy.AudioMix")
