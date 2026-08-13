@@ -176,11 +176,13 @@ internal object VoipAudioPolicy {
         val format = template.format
         val bufferSize = AudioRecord.getMinBufferSize(
             format.sampleRate,
-            AudioFormat.CHANNEL_IN_STEREO,
+            format.channelMask,
             format.encoding,
         )
         if (bufferSize <= 0) {
-            throw IllegalStateException("VoIP null-Context sink minBufferSize=$bufferSize")
+            throw IllegalStateException(
+                "VoIP null-Context sink minBufferSize=$bufferSize channelMask=${format.channelMask}",
+            )
         }
 
         val builder = AudioRecord.Builder()
