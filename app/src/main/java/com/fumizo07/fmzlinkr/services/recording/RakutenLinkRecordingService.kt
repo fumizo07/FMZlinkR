@@ -113,6 +113,8 @@ class RakutenLinkRecordingService : Service() {
     private var monitoringGeneration = 0L
     private var callGeneration = 0L
     private var currentUri: Uri? = null
+    private var endPending = false
+    private var lastObservedMode = Int.MIN_VALUE
 
     private val modePoll = object : Runnable {
         override fun run() {
@@ -122,7 +124,10 @@ class RakutenLinkRecordingService : Service() {
     }
 
     private val endRunnable = Runnable {
-        if (audioManager.mode != AudioManager.MODE_IN_COMMUNICATION) {
+        endPending = false
+        val mode = audioManager.mode
+        AppLogger.i("FMZlinkR call-end debounce fired: mode=$mode callActive=$callActive")
+        if (mode != AudioManager.MODE_IN_COMMUNICATION) {
             scope.launch { handleCallEnded() }
         }
     }
@@ -148,6 +153,7 @@ class RakutenLinkRecordingService : Service() {
             lateArmCall = false
             callKind = CallKind.NONE
             currentUri = null
+            endPending = false
             prefs.setMonitoringEnabled(false)
             handler.removeCallbacks(modePoll)
             handler.removeCallbacks(endRunnable)
@@ -240,7 +246,10 @@ class RakutenLinkRecordingService : Service() {
                 callActive = lateArmCall
                 callGeneration++
                 callKind = if (lateArmCall) CallKind.UNKNOWN else CallKind.NONE
+                lastObservedMode = Int.MIN_VALUE
+                endPending = false
                 handler.removeCallbacks(modePoll)
+                handler.removeCallbacks(endRunnable)
                 handler.post(modePoll)
 
                 if (lateArmCall) {
@@ -290,6 +299,10 @@ class RakutenLinkRecordingService : Service() {
         lateArmCall = false
         callKind = CallKind.NONE
         currentUri = null
+        endPending = false
+        handler.removeCallbacks(modePoll)
+        handler.removeCallbacks(endRunnable)
+        overlay.hide()
         shizukuManager.unbind()
         updateNotification(message)
         handler.postDelayed({
@@ -306,6 +319,7 @@ class RakutenLinkRecordingService : Service() {
         bindJob = null
         handler.removeCallbacks(modePoll)
         handler.removeCallbacks(endRunnable)
+        endPending = false
         overlay.hide()
 
         val service = shellService
@@ -333,17 +347,27 @@ class RakutenLinkRecordingService : Service() {
     }
 
     private fun evaluateMode(mode: Int) {
+        if (mode != lastObservedMode) {
+            AppLogger.i("FMZlinkR audio mode changed: $lastObservedMode -> $mode callActive=$callActive")
+            lastObservedMode = mode
+        }
         if (!armed) return
+
         if (mode == AudioManager.MODE_IN_COMMUNICATION) {
-            handler.removeCallbacks(endRunnable)
+            if (endPending) {
+                handler.removeCallbacks(endRunnable)
+                endPending = false
+                AppLogger.d("FMZlinkR call-end debounce cancelled because IN_COMMUNICATION resumed")
+            }
             if (!callActive) {
                 callActive = true
                 callKind = CallKind.CHECKING
                 val generation = ++callGeneration
                 scope.launch { handleCallStarted(generation) }
             }
-        } else if (callActive) {
-            handler.removeCallbacks(endRunnable)
+        } else if (callActive && !endPending) {
+            endPending = true
+            AppLogger.i("FMZlinkR scheduling call end: mode=$mode debounce=${END_DEBOUNCE_MS}ms")
             handler.postDelayed(endRunnable, END_DEBOUNCE_MS)
         }
     }
@@ -401,12 +425,14 @@ class RakutenLinkRecordingService : Service() {
 
     private suspend fun handleCallEnded() {
         if (!callActive) return
+        endPending = false
         callGeneration++
         if (recording || startingRecording) stopRecording(keepControls = false)
         callActive = false
         lateArmCall = false
         callKind = CallKind.NONE
         overlay.hide()
+        AppLogger.i("FMZlinkR call ended; overlay hidden and monitoring remains armed=$armed")
         updateNotification(if (armed) "Rakuten Link録音待機中" else "録音待機停止")
     }
 
@@ -605,6 +631,7 @@ class RakutenLinkRecordingService : Service() {
         bindJob = null
         handler.removeCallbacks(modePoll)
         handler.removeCallbacks(endRunnable)
+        endPending = false
         overlay.hide()
 
         // Fallback for Android destroying the service without ACTION_DISABLE. Do cleanup before
