@@ -27,11 +27,7 @@ class ShellService : IShellService.Stub {
 
     @Keep
     constructor(context: Context?) {
-        val processPackage = runCatching {
-            Class.forName("android.app.ActivityThread")
-                .getMethod("currentPackageName")
-                .invoke(null) as String?
-        }.getOrNull()
+        val processPackage = currentProcessPackageName()
         AppLogger.i(
             "FMZlinkR ShellService started uid=${android.os.Process.myUid()} " +
                 "context=${context != null} contextPackage=${context?.packageName} processPackage=$processPackage",
@@ -40,6 +36,10 @@ class ShellService : IShellService.Stub {
 
     override fun setLogCallback(listener: ILogCallback, isRedactionEnabled: Boolean) {
         AppLogger.initAsRemote(listener, isRedactionEnabled)
+        AppLogger.i(
+            "FMZlinkR ShellService logger attached uid=${android.os.Process.myUid()} " +
+                "processPackage=${currentProcessPackageName()}",
+        )
     }
 
     override fun armVoipCapture(): Boolean = VoipAudioPolicy.arm()
@@ -100,4 +100,10 @@ class ShellService : IShellService.Stub {
         VoipAudioPolicy.disarm()
         exitProcess(0)
     }
+
+    private fun currentProcessPackageName(): String? = runCatching {
+        Class.forName("android.app.ActivityThread")
+            .getMethod("currentPackageName")
+            .invoke(null) as String?
+    }.getOrNull()
 }
