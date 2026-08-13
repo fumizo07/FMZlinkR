@@ -41,6 +41,11 @@ class ShellService : IShellService.Stub {
             "FMZlinkR ShellService logger attached uid=${android.os.Process.myUid()} " +
                 "processPackage=${currentProcessPackageName()}",
         )
+        runCatching {
+            ShellAudioAttribution.detachClientApplicationPermanently()
+        }.onFailure {
+            AppLogger.e("FMZlinkR could not detach UserService application attribution: ${it.message}", it)
+        }
     }
 
     override fun armVoipCapture(): Boolean = withShellCallingIdentity("armVoipCapture") {
