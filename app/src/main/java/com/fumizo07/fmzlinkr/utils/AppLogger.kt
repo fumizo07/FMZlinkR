@@ -16,6 +16,10 @@ import java.util.ArrayDeque
 
 object AppLogger {
     private const val TAG = "FMZlinkR"
+
+    // Keep the diagnostic implementation available for future device investigations, but do not
+    // retain an in-app diagnostic history during normal use.
+    private const val DIAGNOSTIC_BUFFER_ENABLED = false
     private const val DIAGNOSTIC_MAX_LINES = 240
     private const val DIAGNOSTIC_MAX_LINE_CHARS = 1_800
     private val diagnosticTimeFormat = DateTimeFormatter.ofPattern("HH:mm:ss.SSS")
@@ -48,18 +52,21 @@ object AppLogger {
     fun w(message: String, throwable: Throwable? = null) = write("W", TAG, message, throwable)
     fun e(message: String, throwable: Throwable? = null) = write("E", TAG, message, throwable)
 
-    /**
-     * Returns recent app + Shizuku UserService logs that were forwarded into the app process.
-     * This intentionally lives only in memory: it is diagnostic state, not a recording or permanent log.
-     */
-    fun diagnosticSnapshot(maxLines: Int = 160): String = synchronized(diagnosticLines) {
-        val limit = maxLines.coerceIn(1, DIAGNOSTIC_MAX_LINES)
-        diagnosticLines.toList().takeLast(limit).joinToString("\n")
+    /** Disabled in normal builds; retained so the temporary diagnostics UI can be re-enabled later. */
+    fun diagnosticSnapshot(maxLines: Int = 160): String {
+        if (!DIAGNOSTIC_BUFFER_ENABLED) return ""
+        return synchronized(diagnosticLines) {
+            val limit = maxLines.coerceIn(1, DIAGNOSTIC_MAX_LINES)
+            diagnosticLines.toList().takeLast(limit).joinToString("\n")
+        }
     }
 
-    fun clearDiagnostics() = synchronized(diagnosticLines) {
-        diagnosticLines.clear()
-        appendDiagnosticLocked("I", TAG, "Diagnostic log cleared")
+    fun clearDiagnostics() {
+        if (!DIAGNOSTIC_BUFFER_ENABLED) return
+        synchronized(diagnosticLines) {
+            diagnosticLines.clear()
+            appendDiagnosticLocked("I", TAG, "Diagnostic log cleared")
+        }
     }
 
     private fun write(level: String, tag: String, message: String, throwable: Throwable?, forward: Boolean = true) {
@@ -84,8 +91,11 @@ object AppLogger {
         }
     }
 
-    private fun appendDiagnostic(level: String, tag: String, message: String) = synchronized(diagnosticLines) {
-        appendDiagnosticLocked(level, tag, message)
+    private fun appendDiagnostic(level: String, tag: String, message: String) {
+        if (!DIAGNOSTIC_BUFFER_ENABLED) return
+        synchronized(diagnosticLines) {
+            appendDiagnosticLocked(level, tag, message)
+        }
     }
 
     private fun appendDiagnosticLocked(level: String, tag: String, message: String) {

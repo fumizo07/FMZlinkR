@@ -9,6 +9,7 @@ package com.fumizo07.fmzlinkr.services.shell
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaCodec
+import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.media.MediaRecorder
@@ -20,11 +21,13 @@ import java.util.concurrent.BlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** Far party from AudioPolicy + near party from MIC, downmixed to one Opus stream. */
+/** Far party from AudioPolicy + near party from MIC, downmixed to one encoded audio stream. */
 internal class VoipCaptureSession(
+    audioCodec: String,
     private val bitRate: Int,
     private val outFd: ParcelFileDescriptor,
 ) {
+    private val outputCodec = OutputCodec.fromKey(audioCodec)
     private val stopRequested = AtomicBoolean(false)
 
     @Volatile var farPartyHeard: Boolean = false
@@ -64,17 +67,20 @@ internal class VoipCaptureSession(
         nearRecord = near
         AppLogger.i("VoIP null-Context MIC initialised successfully")
 
-        val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_OPUS, SAMPLE_RATE, 1).apply {
+        val format = MediaFormat.createAudioFormat(outputCodec.mimeType, SAMPLE_RATE, 1).apply {
             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
+            if (outputCodec == OutputCodec.AAC) {
+                setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+            }
             setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, MAX_INPUT_SIZE)
         }
-        val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_OPUS).apply {
+        val enc = MediaCodec.createEncoderByType(outputCodec.mimeType).apply {
             configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         }
         encoder = enc
 
         // Create the muxer last, matching the proven capture ordering.
-        val mux = MediaMuxer(outFd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_OGG)
+        val mux = MediaMuxer(outFd.fileDescriptor, outputCodec.muxerOutputFormat)
         muxer = mux
 
         enc.start()
@@ -86,7 +92,7 @@ internal class VoipCaptureSession(
         if (near.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
             throw IllegalStateException("VoIP MIC AudioRecord did not enter RECORDSTATE_RECORDING")
         }
-        AppLogger.i("VoIP capture started: opus rate=$SAMPLE_RATE bitRate=$bitRate")
+        AppLogger.i("VoIP capture started: codec=${outputCodec.key} rate=$SAMPLE_RATE bitRate=$bitRate")
 
         muxThread = Thread {
             runCatching { captureLoop(near, far, enc, mux) }
@@ -357,7 +363,7 @@ internal class VoipCaptureSession(
         runCatching { nearRecord?.release() }
         runCatching { encoder?.stop() }
         runCatching { encoder?.release() }
-        runCatching { muxer?.stop() } // Writes the OGG trailer when the muxer was started.
+        runCatching { muxer?.stop() } // Finalises the selected container when the muxer was started.
         runCatching { muxer?.release() }
         runCatching { outFd.close() }
         farRecord = null
@@ -380,6 +386,22 @@ internal class VoipCaptureSession(
         nearRecord = null
         encoder = null
         muxer = null
+    }
+
+    private enum class OutputCodec(
+        val key: String,
+        val mimeType: String,
+        val muxerOutputFormat: Int,
+    ) {
+        OPUS("opus", MediaFormat.MIMETYPE_AUDIO_OPUS, MediaMuxer.OutputFormat.MUXER_OUTPUT_OGG),
+        AAC("aac", MediaFormat.MIMETYPE_AUDIO_AAC, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+
+        companion object {
+            fun fromKey(key: String): OutputCodec = when (key.lowercase()) {
+                AAC.key -> AAC
+                else -> OPUS
+            }
+        }
     }
 
     private companion object {

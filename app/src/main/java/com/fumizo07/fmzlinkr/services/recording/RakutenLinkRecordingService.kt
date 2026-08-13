@@ -21,6 +21,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.documentfile.provider.DocumentFile
@@ -59,12 +60,20 @@ class RakutenLinkRecordingService : Service() {
         const val ACTION_REFRESH_SETTINGS = "com.fumizo07.fmzlinkr.action.REFRESH_RAKUTEN_SETTINGS"
 
         private const val RAKUTEN_PACKAGE = "jp.co.rakuten.mobile.rcs"
-        private const val CHANNEL_ID = "fmzlinkr_recording"
-        private const val NOTIFICATION_ID = 7012
+        private const val MONITORING_CHANNEL_ID = "fmzlinkr_monitoring"
+        private const val RECORDING_EVENT_CHANNEL_ID = "fmzlinkr_recording_events"
+        private const val FOREGROUND_NOTIFICATION_ID = 7012
+        private const val RECORDING_EVENT_NOTIFICATION_ID = 7013
         private const val MODE_POLL_MS = 750L
         private const val END_DEBOUNCE_MS = 1_500L
-        private const val OPUS_BIT_RATE = 16_000
+        private const val INCOMING_HINT_VALID_MS = 60_000L
         private const val OGG_MIME = "audio/ogg"
+        private const val M4A_MIME = "audio/mp4"
+
+        // FMZlinkR filename convention requested by the project owner.
+        // Note that these tokens intentionally differ from the usual English direction naming.
+        private const val FILE_DIRECTION_OUTGOING = "in"
+        private const val FILE_DIRECTION_INCOMING = "out"
 
         fun enable(context: Context) {
             ContextCompat.startForegroundService(
@@ -115,6 +124,8 @@ class RakutenLinkRecordingService : Service() {
     private var currentUri: Uri? = null
     private var endPending = false
     private var lastObservedMode = Int.MIN_VALUE
+    private var lastRingtoneAtElapsedMs = 0L
+    private var currentDirectionToken = FILE_DIRECTION_OUTGOING
 
     private val modePoll = object : Runnable {
         override fun run() {
@@ -124,11 +135,14 @@ class RakutenLinkRecordingService : Service() {
     }
 
     private val endRunnable = Runnable {
-        endPending = false
         val mode = audioManager.mode
         AppLogger.i("FMZlinkR call-end debounce fired: mode=$mode callActive=$callActive")
         if (mode != AudioManager.MODE_IN_COMMUNICATION) {
+            // Keep endPending=true until handleCallEnded() runs so the 750ms mode poll cannot schedule
+            // a duplicate 1.5s debounce in the small window before the coroutine is dispatched.
             scope.launch { handleCallEnded() }
+        } else {
+            endPending = false
         }
     }
 
@@ -137,7 +151,7 @@ class RakutenLinkRecordingService : Service() {
         prefs = FmzPreferences(this)
         audioManager = getSystemService(AudioManager::class.java)
         overlay = FmzOverlayController(this)
-        createNotificationChannel()
+        createNotificationChannels()
         shizukuManager = ShizukuConnectionManager(this) {
             AppLogger.w("FMZlinkR lost its Shizuku UserService connection")
             monitoringGeneration++
@@ -154,6 +168,8 @@ class RakutenLinkRecordingService : Service() {
             callKind = CallKind.NONE
             currentUri = null
             endPending = false
+            lastRingtoneAtElapsedMs = 0L
+            currentDirectionToken = FILE_DIRECTION_OUTGOING
             prefs.setMonitoringEnabled(false)
             handler.removeCallbacks(modePoll)
             handler.removeCallbacks(endRunnable)
@@ -161,7 +177,7 @@ class RakutenLinkRecordingService : Service() {
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
-        startForegroundCompat(buildNotification("Rakuten Link録音待機を準備中"))
+        startForegroundCompat(buildMonitoringNotification("Rakuten Link録音待機を準備中"))
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -204,7 +220,7 @@ class RakutenLinkRecordingService : Service() {
         val generation = ++monitoringGeneration
         prefs.setMonitoringEnabled(true)
         binding = true
-        updateNotification("Shizuku UserServiceへ接続中")
+        updateMonitoringNotification("Rakuten Link録音待機を準備中")
 
         bindJob?.cancel()
         bindJob = scope.launch {
@@ -248,15 +264,17 @@ class RakutenLinkRecordingService : Service() {
                 callKind = if (lateArmCall) CallKind.UNKNOWN else CallKind.NONE
                 lastObservedMode = Int.MIN_VALUE
                 endPending = false
+                lastRingtoneAtElapsedMs = 0L
+                currentDirectionToken = FILE_DIRECTION_OUTGOING
                 handler.removeCallbacks(modePoll)
                 handler.removeCallbacks(endRunnable)
                 handler.post(modePoll)
 
                 if (lateArmCall) {
-                    updateNotification("現在の通話には待機開始が遅いため、次の通話から録音できます")
+                    updateMonitoringNotification("録音待機中（現在の通話は次回から有効）")
                     AppLogger.w("FMZlinkR armed after the current VoIP track was created; current call skipped")
                 } else {
-                    updateNotification("Rakuten Link録音待機中")
+                    updateMonitoringNotification()
                     AppLogger.i("FMZlinkR ready: AudioPolicy armed before the next call")
                 }
             } catch (e: CancellationException) {
@@ -300,11 +318,13 @@ class RakutenLinkRecordingService : Service() {
         callKind = CallKind.NONE
         currentUri = null
         endPending = false
+        lastRingtoneAtElapsedMs = 0L
+        currentDirectionToken = FILE_DIRECTION_OUTGOING
         handler.removeCallbacks(modePoll)
         handler.removeCallbacks(endRunnable)
         overlay.hide()
         shizukuManager.unbind()
-        updateNotification(message)
+        showRecordingEvent("録音待機を開始できません", message)
         handler.postDelayed({
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
@@ -332,6 +352,8 @@ class RakutenLinkRecordingService : Service() {
         startingRecording = false
         callKind = CallKind.NONE
         currentUri = null
+        lastRingtoneAtElapsedMs = 0L
+        currentDirectionToken = FILE_DIRECTION_OUTGOING
 
         scope.launch {
             if (service != null) {
@@ -353,6 +375,10 @@ class RakutenLinkRecordingService : Service() {
         }
         if (!armed) return
 
+        if (mode == AudioManager.MODE_RINGTONE && !callActive) {
+            lastRingtoneAtElapsedMs = SystemClock.elapsedRealtime()
+        }
+
         if (mode == AudioManager.MODE_IN_COMMUNICATION) {
             if (endPending) {
                 handler.removeCallbacks(endRunnable)
@@ -360,6 +386,13 @@ class RakutenLinkRecordingService : Service() {
                 AppLogger.d("FMZlinkR call-end debounce cancelled because IN_COMMUNICATION resumed")
             }
             if (!callActive) {
+                val now = SystemClock.elapsedRealtime()
+                val looksIncoming = lastRingtoneAtElapsedMs > 0L &&
+                    now - lastRingtoneAtElapsedMs in 0..INCOMING_HINT_VALID_MS
+                currentDirectionToken = if (looksIncoming) FILE_DIRECTION_INCOMING else FILE_DIRECTION_OUTGOING
+                lastRingtoneAtElapsedMs = 0L
+                AppLogger.i("FMZlinkR filename direction token=$currentDirectionToken incomingHint=$looksIncoming")
+
                 callActive = true
                 callKind = CallKind.CHECKING
                 val generation = ++callGeneration
@@ -375,7 +408,7 @@ class RakutenLinkRecordingService : Service() {
     private suspend fun handleCallStarted(generation: Long) {
         if (lateArmCall) return
         val service = shellService ?: return
-        updateNotification("VoIP通話を確認中")
+        updateMonitoringNotification()
 
         val rakutenUid = runCatching {
             packageManager.getApplicationInfo(RAKUTEN_PACKAGE, 0).uid
@@ -413,27 +446,31 @@ class RakutenLinkRecordingService : Service() {
                 // Unknown is never auto-recorded, but manual capture remains available for OEMs
                 // whose audio service does not expose the playback owner UID reliably.
                 refreshVisibleControls()
-                updateNotification("VoIPアプリを特定できません。手動録音のみ利用できます")
             }
             CallKind.OTHER -> {
                 overlay.hide()
-                updateNotification("Rakuten Link以外のVoIP通話は録音しません")
+                updateMonitoringNotification()
             }
             else -> Unit
         }
     }
 
     private suspend fun handleCallEnded() {
-        if (!callActive) return
+        if (!callActive) {
+            endPending = false
+            return
+        }
         endPending = false
+        handler.removeCallbacks(endRunnable)
         callGeneration++
         if (recording || startingRecording) stopRecording(keepControls = false)
         callActive = false
         lateArmCall = false
         callKind = CallKind.NONE
+        currentDirectionToken = FILE_DIRECTION_OUTGOING
         overlay.hide()
         AppLogger.i("FMZlinkR call ended; overlay hidden and monitoring remains armed=$armed")
-        updateNotification(if (armed) "Rakuten Link録音待機中" else "録音待機停止")
+        if (armed) updateMonitoringNotification()
     }
 
     private suspend fun startRecording(manual: Boolean) {
@@ -446,23 +483,26 @@ class RakutenLinkRecordingService : Service() {
         val generation = callGeneration
         val folder = prefs.getRecordingFolderUri() ?: return
         if (!SafHelper.isFolderValid(this, folder)) {
-            updateNotification("録音保存先へ書き込めません")
+            showRecordingEvent("録音開始に失敗", "録音保存先へ書き込めません")
             return
         }
 
+        val codec = prefs.getAudioCodec()
+        val bitRate = prefs.getAudioBitRate()
+        val fileName = buildRecordingFileName(codec)
+        val mimeType = if (codec == FmzPreferences.AUDIO_CODEC_AAC) M4A_MIME else OGG_MIME
+
         startingRecording = true
-        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss.SSSZ", Locale.CANADA).format(Date())
-        val fileName = "${stamp}_RakutenLink.ogg"
-        val saf = SafHelper.createAudioFile(this, folder, fileName, OGG_MIME)
+        val saf = SafHelper.createAudioFile(this, folder, fileName, mimeType)
         if (saf == null) {
             startingRecording = false
-            updateNotification("録音ファイルを作成できません")
+            showRecordingEvent("録音開始に失敗", "録音ファイルを作成できません")
             return
         }
 
         val started = runCatching {
             withContext(Dispatchers.IO) {
-                service.startVoipRecording(OPUS_BIT_RATE, saf.descriptor)
+                service.startVoipRecording(bitRate, codec, saf.descriptor)
             }
         }.onFailure {
             AppLogger.e("FMZlinkR VoIP capture start failed: ${it.message}", it)
@@ -472,7 +512,7 @@ class RakutenLinkRecordingService : Service() {
 
         if (!started) {
             runCatching { DocumentFile.fromSingleUri(this, saf.uri)?.delete() }
-            updateNotification("録音開始に失敗しました。次の通話前から待機をONにしてください")
+            showRecordingEvent("録音開始に失敗", "次の通話前から録音待機をONにしてください")
             return
         }
 
@@ -489,7 +529,10 @@ class RakutenLinkRecordingService : Service() {
 
         currentUri = saf.uri
         recording = true
-        AppLogger.i("FMZlinkR Rakuten Link recording started -> ${saf.displayName}, manual=$manual")
+        AppLogger.i(
+            "FMZlinkR Rakuten Link recording started -> ${saf.displayName}, manual=$manual codec=$codec bitRate=$bitRate",
+        )
+        showRecordingEvent("録音開始", saf.displayName)
         refreshVisibleControls()
     }
 
@@ -521,23 +564,53 @@ class RakutenLinkRecordingService : Service() {
             "FMZlinkR Rakuten Link recording stopped: size=$size nearPartyHeard=$nearHeard farPartyHeard=$farHeard",
         )
 
+        val eventText = when {
+            size <= 0L -> "録音停止。ファイルサイズを確認してください"
+            !nearHeard && !farHeard -> "録音停止。自分側・相手側とも音声を検出できませんでした"
+            !nearHeard -> "録音停止。自分側音声を検出できませんでした"
+            !farHeard -> "録音停止。相手側音声を検出できませんでした"
+            else -> "録音を保存しました"
+        }
+        showRecordingEvent("録音停止", eventText)
+
         if (keepControls && callActive) {
             refreshVisibleControls()
-            when {
-                !nearHeard && !farHeard -> updateNotification("録音停止。自分側・相手側とも音声を検出できませんでした")
-                !nearHeard -> updateNotification("録音停止。自分側音声を検出できませんでした")
-                !farHeard -> updateNotification("録音停止。相手側音声を検出できませんでした")
-            }
         } else {
             overlay.hide()
+            if (armed) updateMonitoringNotification()
         }
+    }
+
+    private fun buildRecordingFileName(codec: String): String {
+        val date = SimpleDateFormat("yyyyMMdd_HHmm_ss.SSS", Locale.CANADA).format(Date())
+        val template = prefs.getFileNameTemplate().ifBlank { FmzPreferences.DEFAULT_FILE_NAME_TEMPLATE }
+        val raw = template
+            .replace("{date}", date)
+            .replace("{direction}", currentDirectionToken)
+            .replace("{app}", "RakutenLink")
+
+        val illegalCharacters = "\\/:*?\"<>|\r\n"
+        val sanitized = raw
+            .map { if (it in illegalCharacters) '_' else it }
+            .joinToString("")
+            .trim()
+            .trim('.')
+            .ifBlank { "${date}_${currentDirectionToken}_RakutenLink" }
+
+        val baseName = when {
+            sanitized.endsWith(".ogg", ignoreCase = true) -> sanitized.dropLast(4)
+            sanitized.endsWith(".m4a", ignoreCase = true) -> sanitized.dropLast(4)
+            else -> sanitized
+        }
+        val extension = if (codec == FmzPreferences.AUDIO_CODEC_AAC) ".m4a" else ".ogg"
+        return "$baseName$extension"
     }
 
     private fun refreshVisibleControls() {
         if (!armed) return
         if (!callActive) {
             overlay.hide()
-            updateNotification("Rakuten Link録音待機中")
+            updateMonitoringNotification()
             return
         }
 
@@ -551,36 +624,44 @@ class RakutenLinkRecordingService : Service() {
                 } else {
                     overlay.hide()
                 }
-                updateNotification(if (recording) "Rakuten Link録音中" else "Rakuten Link通話中 - 手動録音できます")
+                updateMonitoringNotification()
             }
             CallKind.OTHER -> {
                 overlay.hide()
-                updateNotification("Rakuten Link以外のVoIP通話は録音しません")
+                updateMonitoringNotification()
             }
-            CallKind.CHECKING -> updateNotification("VoIP通話を確認中")
+            CallKind.CHECKING -> updateMonitoringNotification()
             CallKind.NONE -> Unit
         }
     }
 
-    private fun createNotificationChannel() {
-        val channel = NotificationChannel(
-            CHANNEL_ID,
+    private fun createNotificationChannels() {
+        val notificationManager = getSystemService(NotificationManager::class.java)
+        val monitoringChannel = NotificationChannel(
+            MONITORING_CHANNEL_ID,
             "FMZlinkR 録音待機",
             NotificationManager.IMPORTANCE_LOW,
         ).apply {
-            description = "Rakuten Link録音待機と録音状態"
+            description = "Rakuten Link録音待機の継続通知"
         }
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        val recordingEventChannel = NotificationChannel(
+            RECORDING_EVENT_CHANNEL_ID,
+            "FMZlinkR 録音開始・停止",
+            NotificationManager.IMPORTANCE_DEFAULT,
+        ).apply {
+            description = "Rakuten Link録音の開始・停止・エラー通知"
+        }
+        notificationManager.createNotificationChannels(listOf(monitoringChannel, recordingEventChannel))
     }
 
-    private fun buildNotification(text: String): Notification {
+    private fun buildMonitoringNotification(text: String = "Rakuten Link録音待機中"): Notification {
         val openIntent = PendingIntent.getActivity(
             this,
             1,
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, MONITORING_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_mic)
             .setContentTitle("FMZlinkR")
             .setContentText(text)
@@ -612,15 +693,38 @@ class RakutenLinkRecordingService : Service() {
         return builder.build()
     }
 
-    private fun updateNotification(text: String) {
-        startForegroundCompat(buildNotification(text))
+    private fun updateMonitoringNotification(text: String = "Rakuten Link録音待機中") {
+        startForegroundCompat(buildMonitoringNotification(text))
+    }
+
+    private fun showRecordingEvent(title: String, text: String) {
+        val openIntent = PendingIntent.getActivity(
+            this,
+            4,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification = NotificationCompat.Builder(this, RECORDING_EVENT_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_mic)
+            .setContentTitle("FMZlinkR - $title")
+            .setContentText(text)
+            .setContentIntent(openIntent)
+            .setAutoCancel(true)
+            .setCategory(NotificationCompat.CATEGORY_STATUS)
+            .build()
+        getSystemService(NotificationManager::class.java)
+            .notify(RECORDING_EVENT_NOTIFICATION_ID, notification)
     }
 
     private fun startForegroundCompat(notification: Notification) {
         if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            startForeground(
+                FOREGROUND_NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+            )
         } else {
-            startForeground(NOTIFICATION_ID, notification)
+            startForeground(FOREGROUND_NOTIFICATION_ID, notification)
         }
     }
 
