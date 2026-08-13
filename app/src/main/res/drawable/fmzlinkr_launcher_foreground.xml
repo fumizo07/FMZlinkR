@@ -1,17 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- FMZlinkR independent launcher mark: a simple link symbol. -->
+<!-- FMZlinkR independent launcher mark: microphone/recording symbol. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <group
-        android:scaleX="3"
-        android:scaleY="3"
-        android:translateX="18"
-        android:translateY="18">
-        <path
-            android:fillColor="#FFFFFFFF"
-            android:pathData="M3.9,12c0,-1.71 1.39,-3.1 3.1,-3.1h4V7H7a5,5 0,0 0,0 10h4v-1.9H7c-1.71,0 -3.1,-1.39 -3.1,-3.1zM8,13h8v-2H8v2zM17,7h-4v1.9h4c1.71,0 3.1,1.39 3.1,3.1s-1.39,3.1 -3.1,3.1h-4V17h4a5,5 0,0 0,0 -10z" />
-    </group>
+
+    <!-- Microphone capsule. Kept inside the adaptive-icon safe zone. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M54,24 C46.3,24 40,30.3 40,38 L40,55 C40,62.7 46.3,69 54,69 C61.7,69 68,62.7 68,55 L68,38 C68,30.3 61.7,24 54,24 Z" />
+
+    <!-- Mic support, stem and base. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M32,52 L38,52 L38,56 C38,64.8 45.2,72 54,72 C62.8,72 70,64.8 70,56 L70,52 L76,52 L76,56 C76,67.1 67.7,76.3 57,77.8 L57,86 L66,86 L66,92 L42,92 L42,86 L51,86 L51,77.8 C40.3,76.3 32,67.1 32,56 Z" />
 </vector>
