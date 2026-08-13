@@ -59,19 +59,10 @@ internal class VoipCaptureSession(
         )
         if (minBuf <= 0) throw IllegalStateException("VoIP mic minBufferSize=$minBuf")
 
-        @Suppress("MissingPermission")
-        val near = AudioRecord(
-            MediaRecorder.AudioSource.MIC,
-            SAMPLE_RATE,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-            minBuf * BUFFER_FACTOR,
-        )
-        if (near.state != AudioRecord.STATE_INITIALIZED) {
-            runCatching { near.release() }
-            throw IllegalStateException("VoIP mic capture failed to initialise")
-        }
+        val near = createShellMic(minBuf * BUFFER_FACTOR)
+            ?: throw IllegalStateException("VoIP mic capture failed to initialise with shell attribution")
         nearRecord = near
+        AppLogger.i("VoIP null-Context MIC initialised successfully")
 
         val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_OPUS, SAMPLE_RATE, 1).apply {
             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
@@ -106,6 +97,28 @@ internal class VoipCaptureSession(
             start()
         }
     }
+
+    /**
+     * AudioRecord.Builder keeps its attribution Context null until setContext() is explicitly called.
+     * That is required inside Shizuku UserService: the process is shell uid 2000, while the Application
+     * object belongs to FMZlinkR's package. Using the legacy AudioRecord constructor would implicitly
+     * attach that Application Context and can make native AudioRecord attribution validation fail.
+     */
+    @Suppress("MissingPermission")
+    private fun createShellMic(bufferSize: Int): AudioRecord? = runCatching {
+        val format = AudioFormat.Builder()
+            .setSampleRate(SAMPLE_RATE)
+            .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+            .build()
+        AudioRecord.Builder()
+            .setAudioSource(MediaRecorder.AudioSource.MIC)
+            .setAudioFormat(format)
+            .setBufferSizeInBytes(bufferSize)
+            .build()
+    }.onFailure {
+        AppLogger.e("VoIP null-Context MIC construction failed: ${it.message}", it)
+    }.getOrNull()
 
     private fun captureLoop(near: AudioRecord, far: AudioRecord, enc: MediaCodec, mux: MediaMuxer) {
         val qNear: BlockingQueue<ByteArray> = ArrayBlockingQueue(QUEUE_CHUNKS)
@@ -254,16 +267,7 @@ internal class VoipCaptureSession(
         )
         if (minBuf <= 0) return null
 
-        @Suppress("MissingPermission")
-        val fresh = runCatching {
-            AudioRecord(
-                MediaRecorder.AudioSource.MIC,
-                SAMPLE_RATE,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                minBuf * BUFFER_FACTOR,
-            )
-        }.getOrNull()
+        val fresh = createShellMic(minBuf * BUFFER_FACTOR)
         if (fresh == null || fresh.state != AudioRecord.STATE_INITIALIZED) {
             AppLogger.w("VoIP MIC re-take failed to initialise; keeping current capture")
             runCatching { fresh?.release() }
