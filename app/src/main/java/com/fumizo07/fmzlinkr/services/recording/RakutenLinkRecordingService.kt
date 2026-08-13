@@ -61,9 +61,11 @@ class RakutenLinkRecordingService : Service() {
 
         private const val RAKUTEN_PACKAGE = "jp.co.rakuten.mobile.rcs"
         private const val MONITORING_CHANNEL_ID = "fmzlinkr_monitoring"
+        private const val RECORDING_CONTROL_CHANNEL_ID = "fmzlinkr_recording_controls"
         private const val RECORDING_EVENT_CHANNEL_ID = "fmzlinkr_recording_events"
         private const val FOREGROUND_NOTIFICATION_ID = 7012
         private const val RECORDING_EVENT_NOTIFICATION_ID = 7013
+        private const val RECORDING_CONTROL_NOTIFICATION_ID = 7014
         private const val MODE_POLL_MS = 750L
         private const val END_DEBOUNCE_MS = 1_500L
         private const val INCOMING_HINT_VALID_MS = 60_000L
@@ -174,6 +176,7 @@ class RakutenLinkRecordingService : Service() {
             handler.removeCallbacks(modePoll)
             handler.removeCallbacks(endRunnable)
             overlay.hide()
+            hideRecordingControlNotification()
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
@@ -323,6 +326,7 @@ class RakutenLinkRecordingService : Service() {
         handler.removeCallbacks(modePoll)
         handler.removeCallbacks(endRunnable)
         overlay.hide()
+        hideRecordingControlNotification()
         shizukuManager.unbind()
         showRecordingEvent("録音待機を開始できません", message)
         handler.postDelayed({
@@ -341,6 +345,7 @@ class RakutenLinkRecordingService : Service() {
         handler.removeCallbacks(endRunnable)
         endPending = false
         overlay.hide()
+        hideRecordingControlNotification()
 
         val service = shellService
         shellService = null
@@ -449,6 +454,7 @@ class RakutenLinkRecordingService : Service() {
             }
             CallKind.OTHER -> {
                 overlay.hide()
+                hideRecordingControlNotification()
                 updateMonitoringNotification()
             }
             else -> Unit
@@ -469,6 +475,7 @@ class RakutenLinkRecordingService : Service() {
         callKind = CallKind.NONE
         currentDirectionToken = FILE_DIRECTION_OUTGOING
         overlay.hide()
+        hideRecordingControlNotification()
         AppLogger.i("FMZlinkR call ended; overlay hidden and monitoring remains armed=$armed")
         if (armed) updateMonitoringNotification()
     }
@@ -577,6 +584,7 @@ class RakutenLinkRecordingService : Service() {
             refreshVisibleControls()
         } else {
             overlay.hide()
+            hideRecordingControlNotification()
             if (armed) updateMonitoringNotification()
         }
     }
@@ -607,9 +615,13 @@ class RakutenLinkRecordingService : Service() {
     }
 
     private fun refreshVisibleControls() {
-        if (!armed) return
+        if (!armed) {
+            hideRecordingControlNotification()
+            return
+        }
         if (!callActive) {
             overlay.hide()
+            hideRecordingControlNotification()
             updateMonitoringNotification()
             return
         }
@@ -624,14 +636,19 @@ class RakutenLinkRecordingService : Service() {
                 } else {
                     overlay.hide()
                 }
+                showRecordingControlNotification()
                 updateMonitoringNotification()
             }
             CallKind.OTHER -> {
                 overlay.hide()
+                hideRecordingControlNotification()
                 updateMonitoringNotification()
             }
-            CallKind.CHECKING -> updateMonitoringNotification()
-            CallKind.NONE -> Unit
+            CallKind.CHECKING -> {
+                hideRecordingControlNotification()
+                updateMonitoringNotification()
+            }
+            CallKind.NONE -> hideRecordingControlNotification()
         }
     }
 
@@ -644,6 +661,13 @@ class RakutenLinkRecordingService : Service() {
         ).apply {
             description = "Rakuten Link録音待機の継続通知"
         }
+        val recordingControlChannel = NotificationChannel(
+            RECORDING_CONTROL_CHANNEL_ID,
+            "FMZlinkR 録音操作",
+            NotificationManager.IMPORTANCE_LOW,
+        ).apply {
+            description = "Rakuten Link通話中の録音開始・停止操作"
+        }
         val recordingEventChannel = NotificationChannel(
             RECORDING_EVENT_CHANNEL_ID,
             "FMZlinkR 録音開始・停止",
@@ -651,7 +675,9 @@ class RakutenLinkRecordingService : Service() {
         ).apply {
             description = "Rakuten Link録音の開始・停止・エラー通知"
         }
-        notificationManager.createNotificationChannels(listOf(monitoringChannel, recordingEventChannel))
+        notificationManager.createNotificationChannels(
+            listOf(monitoringChannel, recordingControlChannel, recordingEventChannel),
+        )
     }
 
     private fun buildMonitoringNotification(text: String = "Rakuten Link録音待機中"): Notification {
@@ -670,19 +696,6 @@ class RakutenLinkRecordingService : Service() {
             .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
 
-        if (callActive && !lateArmCall && (callKind == CallKind.RAKUTEN || callKind == CallKind.UNKNOWN)) {
-            val action = if (recording) ACTION_MANUAL_STOP else ACTION_MANUAL_START
-            val label = if (recording) "録音停止" else "録音開始"
-            val icon = if (recording) R.drawable.ic_stop else R.drawable.ic_mic
-            val actionIntent = PendingIntent.getService(
-                this,
-                2,
-                Intent(this, RakutenLinkRecordingService::class.java).setAction(action),
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-            )
-            builder.addAction(icon, label, actionIntent)
-        }
-
         val disableIntent = PendingIntent.getService(
             this,
             3,
@@ -695,6 +708,50 @@ class RakutenLinkRecordingService : Service() {
 
     private fun updateMonitoringNotification(text: String = "Rakuten Link録音待機中") {
         startForegroundCompat(buildMonitoringNotification(text))
+    }
+
+    private fun showRecordingControlNotification() {
+        if (
+            !callActive ||
+            lateArmCall ||
+            (callKind != CallKind.RAKUTEN && callKind != CallKind.UNKNOWN)
+        ) {
+            hideRecordingControlNotification()
+            return
+        }
+
+        val openIntent = PendingIntent.getActivity(
+            this,
+            5,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val action = if (recording) ACTION_MANUAL_STOP else ACTION_MANUAL_START
+        val label = if (recording) "録音停止" else "録音開始"
+        val icon = if (recording) R.drawable.ic_stop else R.drawable.ic_mic
+        val actionIntent = PendingIntent.getService(
+            this,
+            6,
+            Intent(this, RakutenLinkRecordingService::class.java).setAction(action),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification = NotificationCompat.Builder(this, RECORDING_CONTROL_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_mic)
+            .setContentTitle("FMZlinkR 録音操作")
+            .setContentText(if (recording) "Rakuten Link録音中" else "Rakuten Link通話中")
+            .setContentIntent(openIntent)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .addAction(icon, label, actionIntent)
+            .build()
+        getSystemService(NotificationManager::class.java)
+            .notify(RECORDING_CONTROL_NOTIFICATION_ID, notification)
+    }
+
+    private fun hideRecordingControlNotification() {
+        getSystemService(NotificationManager::class.java)
+            .cancel(RECORDING_CONTROL_NOTIFICATION_ID)
     }
 
     private fun showRecordingEvent(title: String, text: String) {
@@ -737,6 +794,7 @@ class RakutenLinkRecordingService : Service() {
         handler.removeCallbacks(endRunnable)
         endPending = false
         overlay.hide()
+        hideRecordingControlNotification()
 
         // Fallback for Android destroying the service without ACTION_DISABLE. Do cleanup before
         // cancelling the coroutine scope or removing FMZlinkR's own UserService.
