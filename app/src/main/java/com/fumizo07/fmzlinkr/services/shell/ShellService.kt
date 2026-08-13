@@ -58,11 +58,11 @@ class ShellService : IShellService.Stub {
     }
 
     @Synchronized
-    override fun startVoipRecording(audioBitRate: Int, outFd: ParcelFileDescriptor): Boolean =
+    override fun startVoipRecording(audioBitRate: Int, audioCodec: String, outFd: ParcelFileDescriptor): Boolean =
         withShellCallingIdentity("startVoipRecording") {
             AppLogger.i(
                 "VoIP start requested uid=${android.os.Process.myUid()} callingUid=${Binder.getCallingUid()} " +
-                    "armed=${VoipAudioPolicy.isArmed} active=${voipSession != null}",
+                    "armed=${VoipAudioPolicy.isArmed} active=${voipSession != null} codec=$audioCodec",
             )
             if (voipSession != null) {
                 AppLogger.w("VoIP start rejected: session already active")
@@ -75,7 +75,7 @@ class ShellService : IShellService.Stub {
                 return@withShellCallingIdentity false
             }
             val bitRate = audioBitRate.coerceAtLeast(8_000)
-            val session = VoipCaptureSession(bitRate, outFd)
+            val session = VoipCaptureSession(audioCodec, bitRate, outFd)
             runCatching {
                 session.start()
                 lastVoipFarPartyHeard = false
