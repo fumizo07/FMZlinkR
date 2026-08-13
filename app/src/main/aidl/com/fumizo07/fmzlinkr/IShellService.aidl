@@ -10,8 +10,8 @@ interface IShellService {
     boolean armVoipCapture() = 7;
     void disarmVoipCapture() = 8;
 
-    /** FMZlinkR currently records Opus at the supplied bitrate. */
-    boolean startVoipRecording(int audioBitRate, in ParcelFileDescriptor outFd) = 9;
+    /** Records the mixed VoIP stream using "opus"/OGG or "aac"/M4A at the supplied bitrate. */
+    boolean startVoipRecording(int audioBitRate, String audioCodec, in ParcelFileDescriptor outFd) = 9;
     void stopVoipRecording() = 10;
     boolean voipFarPartyHeard() = 11;
     int voipCallAppUid() = 12;
