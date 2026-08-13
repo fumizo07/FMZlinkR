@@ -174,15 +174,15 @@ internal object VoipAudioPolicy {
             .getMethod("getAudioAttributes")
             .invoke(template) as AudioAttributes
         val format = template.format
+        // Match AudioPolicy.createAudioRecordSink(): it deliberately uses stereo for the minimum
+        // buffer-size query even when the actual sink format is mono, due to channel-mask support.
         val bufferSize = AudioRecord.getMinBufferSize(
             format.sampleRate,
-            format.channelMask,
+            AudioFormat.CHANNEL_IN_STEREO,
             format.encoding,
         )
         if (bufferSize <= 0) {
-            throw IllegalStateException(
-                "VoIP null-Context sink minBufferSize=$bufferSize channelMask=${format.channelMask}",
-            )
+            throw IllegalStateException("VoIP null-Context sink minBufferSize=$bufferSize")
         }
 
         val builder = AudioRecord.Builder()
