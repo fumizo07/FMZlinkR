@@ -14,6 +14,8 @@ internal object VoipAppIdentity {
     private const val USAGE_VOICE_COMMUNICATION = 2
     private const val APP_UID_START = 10_000
     private const val DUMP_TIMEOUT_MS = 1_500L
+    private const val DUMP_READER_JOIN_MS = 750L
+    private const val DUMP_MAX_CHARS = 2_000_000
     private const val RESOLVE_BUDGET_MS = 1_200L
     private const val RETRY_GAP_MS = 150L
     private const val SHELL = "/system/bin/sh"
@@ -94,14 +96,45 @@ internal object VoipAppIdentity {
         val process = ProcessBuilder(SHELL, "-c", "dumpsys audio")
             .redirectErrorStream(true)
             .start()
-        return try {
-            if (!process.waitFor(DUMP_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
-                process.destroyForcibly()
-                return null
+        val output = StringBuilder()
+        val readerThread = Thread {
+            runCatching {
+                process.inputStream.bufferedReader().use { reader ->
+                    while (true) {
+                        val line = reader.readLine() ?: break
+                        synchronized(output) {
+                            if (output.length < DUMP_MAX_CHARS) {
+                                val remaining = DUMP_MAX_CHARS - output.length
+                                if (line.length + 1 <= remaining) {
+                                    output.append(line).append('\n')
+                                } else if (remaining > 0) {
+                                    output.append(line, 0, minOf(line.length, remaining))
+                                }
+                            }
+                        }
+                    }
+                }
+            }.onFailure {
+                AppLogger.d("VoIP dumpsys audio reader ended: ${it.message}")
             }
-            process.inputStream.bufferedReader().use { it.readText() }.takeIf { it.isNotBlank() }
+        }.apply {
+            isDaemon = true
+            name = "fmz-audio-dump-reader"
+            start()
+        }
+
+        return try {
+            val finished = process.waitFor(DUMP_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            if (!finished) {
+                AppLogger.d("VoIP dumpsys audio timed out")
+                process.destroyForcibly()
+                runCatching { process.waitFor(500L, TimeUnit.MILLISECONDS) }
+            }
+            runCatching { readerThread.join(DUMP_READER_JOIN_MS) }
+            synchronized(output) { output.toString() }.takeIf { it.isNotBlank() }
         } finally {
-            runCatching { process.destroy() }
+            if (process.isAlive) runCatching { process.destroyForcibly() }
+            if (readerThread.isAlive) readerThread.interrupt()
         }
     }
 

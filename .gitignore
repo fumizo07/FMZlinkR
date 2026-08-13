@@ -1,0 +1,32 @@
+# Gradle / Android / Kotlin build output
+.gradle/
+.kotlin/
+build/
+**/build/
+
+# Local Android SDK configuration
+local.properties
+
+# IDE/editor state
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Signing material and secrets
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+release-keystore.jks
+
+# Generated release staging
+release-assets/
+
+# Logs / temporary files
+*.log
+*.tmp
+*.swp

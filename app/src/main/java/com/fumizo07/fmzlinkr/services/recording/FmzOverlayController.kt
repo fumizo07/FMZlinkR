@@ -33,6 +33,7 @@ import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import com.fumizo07.fmzlinkr.data.FmzPreferences
 import com.fumizo07.fmzlinkr.ui.common.FmzRecordingOverlay
 import com.fumizo07.fmzlinkr.ui.theme.FMZlinkRTheme
+import com.fumizo07.fmzlinkr.utils.AppLogger
 import kotlin.math.max
 import kotlin.math.min
 
@@ -53,10 +54,16 @@ class FmzOverlayController(private val context: Context) {
 
     fun show(isRecording: Boolean, onActionClick: () -> Unit) {
         if (!prefs.isOverlayEnabled() || !Settings.canDrawOverlays(context)) {
+            if (composeView != null) {
+                AppLogger.i("FMZlinkR overlay hidden because overlay setting/permission is unavailable")
+            }
             hide()
             return
         }
-        if (composeView == null) initView()
+        if (composeView == null) {
+            initView()
+            AppLogger.i("FMZlinkR overlay shown isRecording=$isRecording")
+        }
         composeView?.setContent {
             FMZlinkRTheme(
                 darkTheme = isSystemInDarkTheme(),
@@ -64,7 +71,10 @@ class FmzOverlayController(private val context: Context) {
             ) {
                 FmzRecordingOverlay(
                     isRecording = isRecording,
-                    onActionClick = onActionClick,
+                    onActionClick = {
+                        AppLogger.i("FMZlinkR overlay action clicked isRecording=$isRecording")
+                        onActionClick()
+                    },
                     onDragY = ::moveY,
                     onDragEnd = ::saveY,
                 )
@@ -108,11 +118,13 @@ class FmzOverlayController(private val context: Context) {
     }
 
     fun hide() {
+        val wasVisible = composeView != null
         composeView?.let { runCatching { windowManager.removeView(it) } }
         owner?.destroy()
         owner = null
         composeView = null
         params = null
+        if (wasVisible) AppLogger.i("FMZlinkR overlay hidden")
     }
 
     private class ComposeWindowLifecycleOwner : LifecycleOwner, ViewModelStoreOwner, SavedStateRegistryOwner {

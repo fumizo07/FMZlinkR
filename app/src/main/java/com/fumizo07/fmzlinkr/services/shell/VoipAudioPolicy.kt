@@ -7,9 +7,11 @@
  */
 package com.fumizo07.fmzlinkr.services.shell
 
+import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioRecord
+import android.os.Binder
 import com.fumizo07.fmzlinkr.utils.AppLogger
 import java.lang.reflect.Constructor
 
@@ -63,9 +65,9 @@ internal object VoipAudioPolicy {
 
             val policyClass = Class.forName("android.media.audiopolicy.AudioPolicy")
             val policyBuilderClass = Class.forName("android.media.audiopolicy.AudioPolicy\$Builder")
-            // Null Context is intentional for the shell-uid attribution path used by CallVault.
+            // Null Context is intentional and matches the proven CallVault audio-policy path.
             val policyBuilder = policyBuilderClass
-                .getConstructor(Class.forName("android.content.Context"))
+                .getConstructor(Context::class.java)
                 .newInstance(*arrayOf<Any?>(null))
             policyBuilderClass.getMethod("addMix", mixClass).invoke(policyBuilder, builtMix)
             val builtPolicy = policyBuilderClass.getMethod("build").invoke(policyBuilder)
@@ -83,7 +85,7 @@ internal object VoipAudioPolicy {
             AppLogger.i("VoIP AudioPolicy armed: USAGE_VOICE_COMMUNICATION loopback-render ${SAMPLE_RATE}Hz")
             true
         }.onFailure {
-            AppLogger.e("VoIP AudioPolicy arm failed: ${it.message}", it)
+            AppLogger.e("VoIP AudioPolicy arm failed: ${describeThrowable(it)}", it)
         }.getOrDefault(false)
     }
 
@@ -101,25 +103,56 @@ internal object VoipAudioPolicy {
                 .apply { isAccessible = true }
                 .invoke(null, current)
             AppLogger.i("VoIP AudioPolicy disarmed")
-        }.onFailure { AppLogger.w("VoIP AudioPolicy disarm failed: ${it.message}", it) }
+        }.onFailure { AppLogger.w("VoIP AudioPolicy disarm failed: ${describeThrowable(it)}", it) }
     }
 
     @Synchronized
     fun createSink(): AudioRecord? {
-        val currentPolicy = policy ?: return null
-        val currentMix = mix ?: return null
+        val currentPolicy = policy ?: run {
+            AppLogger.w("VoIP far-party sink requested with no armed AudioPolicy")
+            return null
+        }
+        val currentMix = mix ?: run {
+            AppLogger.w("VoIP far-party sink requested with no AudioMix")
+            return null
+        }
+        AppLogger.i(
+            "VoIP far-party sink creation requested uid=${android.os.Process.myUid()} " +
+                "callingUid=${Binder.getCallingUid()}",
+        )
         return runCatching {
             val policyClass = Class.forName("android.media.audiopolicy.AudioPolicy")
             val mixClass = Class.forName("android.media.audiopolicy.AudioMix")
-            val record = policyClass.getMethod("createAudioRecordSink", mixClass)
-                .invoke(currentPolicy, currentMix) as AudioRecord?
+            val record = ShellAudioAttribution.withoutClientApplication("far-party sink") {
+                policyClass.getMethod("createAudioRecordSink", mixClass)
+                    .invoke(currentPolicy, currentMix) as AudioRecord?
+            }
             if (record == null || record.state != AudioRecord.STATE_INITIALIZED) {
+                val state = record?.state
                 runCatching { record?.release() }
-                AppLogger.w("VoIP far-party sink failed to initialise (state=${record?.state})")
+                AppLogger.w("VoIP far-party sink failed to initialise with shell attribution (state=$state)")
                 null
-            } else record
+            } else {
+                AppLogger.i("VoIP far-party sink initialised successfully with shell attribution")
+                record
+            }
         }.onFailure {
-            AppLogger.e("VoIP far-party sink creation failed: ${it.message}", it)
+            AppLogger.e("VoIP far-party sink creation failed: ${describeThrowable(it)}", it)
         }.getOrNull()
+    }
+
+    private fun describeThrowable(throwable: Throwable): String {
+        var root = throwable
+        val seen = HashSet<Throwable>()
+        while (root.cause != null && root.cause !== root && seen.add(root)) {
+            root = root.cause!!
+        }
+        val rootName = root::class.java.name
+        val rootMessage = root.message?.takeIf { it.isNotBlank() } ?: "(no message)"
+        return if (root === throwable) {
+            "$rootName: $rootMessage"
+        } else {
+            "${throwable::class.java.name} -> $rootName: $rootMessage"
+        }
     }
 }
